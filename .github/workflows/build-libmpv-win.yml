@@ -79,12 +79,12 @@ jobs:
       - name: Collect artifact
         run: |
           mkdir -p dist
-          cp build64/mpv-dev-*/libmpv-2.dll dist/mpv-2.dll
-          ls -lh dist/mpv-2.dll
+          cp build64/mpv-dev-*/libmpv-2.dll dist/libmpv-2.dll
+          ls -lh dist/libmpv-2.dll
 
-      - name: Upload mpv-2.dll
+      - name: Upload libmpv-2.dll
         uses: actions/upload-artifact@v4
         with:
-          name: mpv-2.dll-windows-x86_64
-          path: dist/mpv-2.dll
+          name: libmpv-2.dll-windows-x86_64
+          path: dist/libmpv-2.dll
           if-no-files-found: error
