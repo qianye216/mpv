@@ -1,45 +1,58 @@
 name: build-libmpv-windows
 
-# 构建 Windows 单文件静态 mpv-2.dll（含 gpu-next render backend，支持杜比视界）。
-# 交叉编译体系使用 shinchiro/mpv-winbuild-cmake（Arch 容器 + clang/LLVM 交叉工具链），
-# mpv 源码指向本仓库（含杜比视界补丁），产物为静态链接的独立 DLL。
-#
-# 缓存策略（复刻 Richasy/mpv 自托管 runner 的持久状态，用 actions/cache 实现，
-# 与上游 shinchiro mpv_clang.yml 每日构建同构）：
-#   clang_root   - LLVM 交叉工具链 + rustup（从零构建 1h+，命中缓存则完全跳过）
-#   build64      - 构建树（ExternalProject stamps + mingw 安装前缀；LLVM 的
-#                  构建树在 install 后被配方里的 cleanup() 删除，不会撑爆缓存）
-#   src_packages - 源码包缓存（media.xiph.org 等小镜像偶发 TLS 抖动，
-#                  如 2026-08 的 opus-dnn，缓存后只需成功下载一次）
-# 首次运行缓存全空，等价于旧的从零构建；之后 LLVM/工具链/依赖全部增量。
+# 构建 mpv-dev-x86_64-v3 包（libmpv-2.dll + libmpv.dll.a + 头文件，依赖全部
+# 静态链接进 DLL）。构建流程与 shinchiro/mpv-winbuild-cmake 的
+# .github/workflows/mpv_clang.yml 保持一致（x86_64_v3 分支），仅保留以下差异：
+#   1. 只构建 x86_64-v3 一个架构，只上传 mpv-dev 包（不带播放器/调试包）
+#   2. mpv 源码指向本仓库（含杜比视界补丁），而不是上游 mpv-player/mpv
+#   3. libplacebo 锁定 v7.351.0（本补丁树验证过的版本）
+# 与上游相同的要点（之前失败的主因是对应项不一致）：
+#   - 容器用上游预构建镜像 ghcr.io/shinchiro/archlinux:latest，依赖版本与
+#     上游每日构建完全一致，不再手动 pacman 安装（Arch 滚动更新会引入漂移）
+#   - -DGCC_ARCH=x86-64-v3（v3 微架构，缺失时只是普通 x86-64 包）
+#   - -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON（上游默认配置）
+#   - 缓存布局：clang_root（LLVM+rustup）/ src_packages（源码克隆）/
+#     build_x86_64_v3（工具链与构建树），构建结束后 rm -rf build/mpv* 与
+#     cargo-clean，mpv 每次运行都按当前提交全量重建
 # 需要强制重建工具链时，把 CACHE_VER 改成新字符串作废全部缓存。
 
 on:
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  CACHE_VER: v1
+  CACHE_VER: v2
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build_mpv:
+    name: Building mpv-dev x86_64-v3
     runs-on: ubuntu-latest
-    container: ghcr.io/archlinux/archlinux:base-devel
+    container:
+      image: docker://ghcr.io/shinchiro/archlinux:latest
+    env:
+      BIT: x86_64_v3
     steps:
-      - name: Install dependencies
+      # 对应上游 mpv_clang.yml 的 "Init variable"（x86_64_v3 分支）
+      - name: Init variable
         run: |
-          echo -e "[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
-          pacman-key --init
-          pacman-key --populate archlinux
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm --needed git ninja cmake meson clang lld libc++ \
-            unzip ragel yasm nasm gperf rst2pdf lib32-gcc-libs lib32-glib2 \
-            python-cairo curl wget mimalloc ccache python-pip 7zip shaderc
-          python -m pip install --break-system-packages roman
-          git config --global user.name "github-actions[bot]"
+          echo "arch=x86_64" >> $GITHUB_ENV
+          echo "x86_64_level=-v3" >> $GITHUB_ENV
+          echo "x86_64_v3_ARCH=-DGCC_ARCH=x86-64-v3" >> $GITHUB_ENV
+
+      - name: Setup git config
+        run: |
+          git config --global user.name "github-actions"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase true
+          git config --global rebase.autoStash true
+          git config --global fetch.prune true
+          git config --global --add safe.directory $PWD
 
       - name: Checkout mpv (this repo)
         uses: actions/checkout@v4
@@ -48,30 +61,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: master
           path: mpv-winbuild-cmake
 
-      # 缓存必须在 configure 之前恢复：stamps 在 build64 里，命中后
-      # ninja llvm/llvm-clang 直接跳过；src_packages 让下载步骤只补缺失的包
-      - name: Restore clang_root cache
+      - name: Loading clang sysroot cache
         uses: actions/cache/restore@v4
         with:
           path: clang_root
           key: ${{ env.CACHE_VER }}-clang_root-${{ github.run_id }}
-          restore-keys: ${{ env.CACHE_VER }}-clang_root-
+          restore-keys: ${{ env.CACHE_VER }}-clang_root
 
-      - name: Restore build tree cache
-        uses: actions/cache/restore@v4
-        with:
-          path: build64
-          key: ${{ env.CACHE_VER }}-build64-${{ github.run_id }}
-          restore-keys: ${{ env.CACHE_VER }}-build64-
-
-      - name: Restore source packages cache
+      - name: Loading repository cache
         uses: actions/cache/restore@v4
         with:
           path: src_packages
-          key: ${{ env.CACHE_VER }}-src_packages-${{ github.run_id }}
-          restore-keys: ${{ env.CACHE_VER }}-src_packages-
+          key: ${{ env.CACHE_VER }}-repository-${{ github.run_id }}
+          restore-keys: ${{ env.CACHE_VER }}-repository
+
+      - name: Loading x86_64_v3 toolchain cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build_x86_64_v3
+          key: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain-${{ github.run_id }}
+          restore-keys: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain
 
       - name: Point mpv package source to this repo
         run: |
@@ -84,116 +96,91 @@ jobs:
           # 大版本变动导致与 mpv 0.41 的 API 不兼容
           sed -i 's|GIT_REPOSITORY https://github.com/haasn/libplacebo.git|GIT_REPOSITORY https://github.com/haasn/libplacebo.git\n    GIT_TAG v7.351.0|' \
             mpv-winbuild-cmake/packages/libplacebo.cmake
-          grep -n "GIT_REPOSITORY\|GIT_CLONE\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
+          grep -n "GIT_REPOSITORY\|GIT_CLONE_FLAGS\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
+          # mpv 的远端是本地路径（本仓库的 checkout），force-update 里硬编码的
+          # git fetch --filter=tree:0 对本地远端不可靠；删除旧克隆，让 download
+          # 步骤按本次触发的提交重新克隆（mpv 体积小，代价可忽略）
+          rm -rf src_packages/mpv
 
-          # 参考 Richasy/mpv ci/build-libmpv.sh：命中缓存的构建树里 mpv 的
-          # download stamp 还在，ExternalProject 会跳过克隆、拿旧源码构建；
-          # 每次运行前删掉 mpv 的源码与 stamp，强制重新克隆本仓库当前提交。
-          # （libplacebo 已用 GIT_TAG 锁死，靠 update 步骤前进，无需清除）
-          rm -rf src_packages/mpv \
-                 build64/packages/mpv-prefix \
-                 build64/mpv-dev-*
-
-      - name: Configure
+      # 命令行与上游 mpv_clang.yml 完全一致，仅 -S 指向子目录 checkout
+      - name: Configuring CMake & Downloading source
         run: |
-          # CMAKE_INSTALL_PREFIX/RUSTUP_LOCATION 指到 clang_root，让 LLVM 工具链
-          # 和 rustup 落进可缓存目录（与上游 mpv_clang.yml 布局一致）
-          cmake -Wno-dev --fresh \
-            -DTARGET_ARCH=x86_64-w64-mingw32 \
-            -DCOMPILER_TOOLCHAIN=clang \
-            -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/clang_root \
-            -DMINGW_INSTALL_PREFIX=${GITHUB_WORKSPACE}/build64/x86_64-w64-mingw32 \
-            -DSINGLE_SOURCE_LOCATION=${GITHUB_WORKSPACE}/src_packages \
-            -DRUSTUP_LOCATION=${GITHUB_WORKSPACE}/clang_root/install_rustup \
-            -DENABLE_CCACHE=OFF \
-            -G Ninja -S mpv-winbuild-cmake -B build64
+          cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang ${{ env.x86_64_v3_ARCH }} \
+            -DCMAKE_INSTALL_PREFIX=$PWD/clang_root \
+            -DMINGW_INSTALL_PREFIX=$PWD/build_$BIT/$BIT-w64-mingw32 \
+            -DSINGLE_SOURCE_LOCATION=$PWD/src_packages \
+            -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup \
+            -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON \
+            -G Ninja --fresh -B build_$BIT -S $PWD/mpv-winbuild-cmake
+          ninja -C build_$BIT download || true
 
-      - name: Download package sources
+      - name: Building mpv
         run: |
-          # CMake file(DOWNLOAD) 没有重试机制，小镜像（media.xiph.org 等）偶发
-          # TLS 抖动一次就失败；已下载的包有 stamp 会跳过，整轮重试只补漏。
-          # 缺失的包此处不阻断，留到构建对应目标时再试，失败日志里有详情
-          ok=0
-          for i in 1 2 3; do
-            if ninja -C build64 download; then ok=1; break; fi
-            echo "download round $i failed, retrying in 15s"; sleep 15
-          done
-          [ "$ok" = 1 ] || echo "::warning::部分源码包下载未完成，将在构建阶段重试"
+          ninja -C build_$BIT update
+          ninja -C build_$BIT mpv
 
-      - name: Build LLVM/MinGW toolchain
+      - name: Packaging mpv-dev
         run: |
-          # 必须先构建 LLVM 本体（ninja llvm）装出 clang_root/bin/clang：
-          # mingw-w64-crt 的 x86_64-w64-mingw32-gcc 是 llvm-wrapper 生成的
-          # 包装脚本，内部调用 ${CMAKE_INSTALL_PREFIX}/bin/clang；而 ep 依赖
-          # 顺序里 crt 在 llvm 之前，伞目标 llvm-clang 假定 clang 已存在。
-          # 缓存命中时 stamps 已在 build64，下面两条都是秒级 no-op
-          ninja -C build64 llvm
-          ninja -C build64 llvm-clang
-
-      - name: Ensure rustup (rav1e 等 Rust 依赖需要)
-        # 不再 rustup-fullclean：rustup 装在 clang_root 里随缓存复用，
-        # fullclean 会每轮删掉缓存重新下载
-        run: ninja -C build64 rustup || true
-
-      - name: Build mpv
-        run: |
-          # update：让缓存里跟踪上游 master 的包（ffmpeg 等）前进到最新
-          ninja -C build64 update || true
-          ninja -C build64 mpv
+          ninja -C build_$BIT mpv-packaging
+          mkdir -p release_$BIT
+          # 只取 mpv-dev 包（含 libmpv-2.dll / libmpv.dll.a / include/），
+          # 播放器与 debug 包留在构建树里随清理步骤丢弃
+          mv build_$BIT/mpv-dev-*.7z release_$BIT/
+          # 上游 2026-08 起 vulkan loader 改为动态链接（KhronosGroup/Vulkan-Loader#1538），
+          # libmpv-2.dll 运行时依赖 vulkan-1.dll，一并收集（存在才收）
+          find build_$BIT -name 'vulkan-1.dll' -exec cp {} release_$BIT/ \; 2>/dev/null || true
+          ls -lh release_$BIT/
 
       - name: Dump failed package logs
         if: failure()
         run: |
           # 包配方的 LOG_CONFIGURE/LOG_BUILD=1 会把真实报错吞进 stamp 日志文件，
-          # Actions 日志只能看到退出码；失败时把 download/update/configure/
-          # build/install 日志末尾打出来，避免再次盲排（2026-08 opus-dnn 下载
-          # 失败时就因缺 download 日志多排了一轮）
-          find build64 \( -path '*-stamp/*-configure-*.log' \
-                       -o -path '*-stamp/*-build-*.log' \
-                       -o -path '*-stamp/*-install-*.log' \
-                       -o -path '*-stamp/*-download-*.log' \
-                       -o -path '*-stamp/*-update-*.log' \) 2>/dev/null \
+          # Actions 日志只能看到退出码；失败时把各阶段日志末尾打出来，避免盲排
+          find build_$BIT \( -path '*-stamp/*-configure-*.log' \
+                           -o -path '*-stamp/*-build-*.log' \
+                           -o -path '*-stamp/*-install-*.log' \
+                           -o -path '*-stamp/*-download-*.log' \
+                           -o -path '*-stamp/*-update-*.log' \) 2>/dev/null \
             | while read -r f; do
                 echo "===== $f ====="
                 tail -c 20000 "$f"
                 echo
               done
 
-      - name: Collect artifact
-        run: |
-          mkdir -p dist
-          cp build64/mpv-dev-*/libmpv-2.dll dist/libmpv-2.dll
-          # 上游 2026-08 起 vulkan loader 改为动态链接（KhronosGroup/Vulkan-Loader#1538），
-          # libmpv-2.dll 运行时依赖 vulkan-1.dll，一并收集（存在才收）
-          find build64 -name 'vulkan-1.dll' -not -path '*/dist/*' -exec cp {} dist/ \; 2>/dev/null || true
-          ls -lh dist/
-
-      - name: Upload libmpv-2.dll
+      - name: Uploading mpv-dev package
         uses: actions/upload-artifact@v4
         with:
-          name: libmpv-2.dll-windows-x86_64
-          path: dist/
+          name: mpv-dev-x86_64_v3
+          path: release_x86_64_v3/
           if-no-files-found: error
 
-      # 即使构建失败也保存缓存：比如 LLVM 建了一小时后在 mpv 阶段挂掉，
-      # 工具链缓存照样落盘，下一轮直接从 mpv 阶段继续
-      - name: Save clang_root cache
+      # 以下清理与缓存保存流程和上游 mpv_clang.yml 一致：mpv 的源码克隆之外
+      # 一切构建产物（stamps、包目录）都删掉，mpv 下次运行强制全量重建
+      - name: Cleaning build directory
+        if: always()
+        run: rm -rf build_$BIT/mpv*
+
+      - name: Cleaning rust toolchain directory
+        if: always()
+        run: ninja -C build_$BIT cargo-clean || true
+
+      - name: Saving clang sysroot cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: clang_root
           key: ${{ env.CACHE_VER }}-clang_root-${{ github.run_id }}
 
-      - name: Save build tree cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: build64
-          key: ${{ env.CACHE_VER }}-build64-${{ github.run_id }}
-
-      - name: Save source packages cache
+      - name: Saving repository cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: src_packages
-          key: ${{ env.CACHE_VER }}-src_packages-${{ github.run_id }}
+          key: ${{ env.CACHE_VER }}-repository-${{ github.run_id }}
+
+      - name: Saving x86_64_v3 toolchain cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build_x86_64_v3
+          key: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain-${{ github.run_id }}
