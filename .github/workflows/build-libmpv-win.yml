@@ -1,0 +1,90 @@
+name: build-libmpv-windows
+
+# 构建 Windows 单文件静态 mpv-2.dll（含 gpu-next render backend，支持杜比视界）。
+# 交叉编译体系使用 shinchiro/mpv-winbuild-cmake（Arch 容器 + MinGW 交叉工具链），
+# mpv 源码指向本仓库（含杜比视界补丁），产物为静态链接的独立 DLL。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/archlinux/archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: |
+          echo -e "[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed git ninja cmake meson clang lld libc++ \
+            unzip ragel yasm nasm gperf rst2pdf lib32-gcc-libs lib32-glib2 \
+            python-cairo curl wget mimalloc ccache python-pip 7zip shaderc
+          python -m pip install --break-system-packages roman
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout mpv (this repo)
+        uses: actions/checkout@v4
+
+      - name: Checkout mpv-winbuild-cmake
+        uses: actions/checkout@v4
+        with:
+          repository: shinchiro/mpv-winbuild-cmake
+          path: mpv-winbuild-cmake
+
+      - name: Point mpv package source to this repo
+        run: |
+          # 让 mpv 包从本仓库克隆（而不是上游 mpv-player/mpv）；
+          # 本地路径克隆不支持 --filter=tree:0，删除该克隆参数
+          sed -i "s|GIT_REPOSITORY https://github.com/mpv-player/mpv.git|GIT_REPOSITORY ${GITHUB_WORKSPACE}|" \
+            mpv-winbuild-cmake/packages/mpv.cmake
+          sed -i '/GIT_CLONE_FLAGS/d' mpv-winbuild-cmake/packages/mpv.cmake
+          # libplacebo 锁定到 v7.351.0（本补丁树验证过的版本），避免其 master 未来
+          # 大版本变动导致与 mpv 0.41 的 API 不兼容
+          sed -i 's|GIT_REPOSITORY https://github.com/haasn/libplacebo.git|GIT_REPOSITORY https://github.com/haasn/libplacebo.git\n    GIT_TAG v7.351.0|' \
+            mpv-winbuild-cmake/packages/libplacebo.cmake
+          grep -n "GIT_REPOSITORY\|GIT_CLONE\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
+
+      - name: Configure
+        run: |
+          cmake -Wno-dev --fresh \
+            -DTARGET_ARCH=x86_64-w64-mingw32 \
+            -DCOMPILER_TOOLCHAIN=gcc \
+            -DENABLE_CCACHE=OFF \
+            -DSINGLE_SOURCE_LOCATION=${GITHUB_WORKSPACE}/src_packages \
+            -DRUSTUP_LOCATION=${GITHUB_WORKSPACE}/install_rustup \
+            -G Ninja -S mpv-winbuild-cmake -B build64
+
+      - name: Download package sources
+        run: ninja -C build64 download || true
+
+      - name: Build MinGW toolchain
+        run: ninja -C build64 gcc
+
+      - name: Install rustup (rav1e 等 Rust 依赖需要)
+        run: |
+          ninja -C build64 rustup-fullclean
+          ninja -C build64 rustup
+
+      - name: Build mpv
+        run: ninja -C build64 mpv
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          cp build64/mpv-dev-*/libmpv-2.dll dist/mpv-2.dll
+          ls -lh dist/mpv-2.dll
+
+      - name: Upload mpv-2.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-2.dll-windows-x86_64
+          path: dist/mpv-2.dll
+          if-no-files-found: error
