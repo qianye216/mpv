@@ -6,8 +6,6 @@ name: build-libmpv-windows
 
 on:
   workflow_dispatch:
-  push:
-    branches: [master]
 
 permissions:
   contents: read
@@ -51,6 +49,19 @@ jobs:
           sed -i 's|GIT_REPOSITORY https://github.com/haasn/libplacebo.git|GIT_REPOSITORY https://github.com/haasn/libplacebo.git\n    GIT_TAG v7.351.0|' \
             mpv-winbuild-cmake/packages/libplacebo.cmake
           grep -n "GIT_REPOSITORY\|GIT_CLONE\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
+
+      - name: Work around ngtcp2 configure failure with GNU ld
+        run: |
+          # ngtcp2 配方（上游 2026-08 合入，未经 gcc 工具链验证）把 -lz/-lzstd/-lbrotli*
+          # 塞进 CMAKE_C_FLAGS，位于 try_compile 链接命令行最前；GNU ld 单趟扫描不回溯
+          # 左侧静态库，导致 OpenSSL QUIC 检测（SSL_set_quic_tls_cbs，链接静态
+          # libssl/libcrypto 需要 zstd/brotli/z）失败并触发 FATAL_ERROR。
+          # lld 支持回溯所以 clang 工具链不受影响。
+          # 预置检测结果可跳过该 try_compile（check_symbol_exists 对已定义的缓存变量直接采信）；
+          # openssl.cmake 锁定的是 openssl master（>=3.5），本就提供 SSL_set_quic_tls_cbs，预置值属实。
+          sed -i 's|-DBUILD_TESTING=OFF|-DBUILD_TESTING=OFF\n        -DHAVE_SSL_SET_QUIC_TLS_CBS=TRUE|' \
+            mpv-winbuild-cmake/packages/ngtcp2.cmake
+          grep -n "HAVE_SSL_SET_QUIC_TLS_CBS" mpv-winbuild-cmake/packages/ngtcp2.cmake
 
       - name: Configure
         run: |
