@@ -1,0 +1,72 @@
+name: build-libmpv-macos
+
+# 构建 macOS 自包含静态 libmpv.2.dylib（universal：arm64 + x86_64）。
+# 与 Windows 版 libmpv-2.dll 对应：所有第三方依赖（ffmpeg/libass/libplacebo/
+# libbluray/libdvdnav 等）从源码静态链入，产物仅依赖系统库，可直接拷贝进
+# 应用目录使用，无需用户安装任何东西。含本仓库特性：在线播放 ISO 光盘
+# 镜像、gpu-next render backend（杜比视界）。
+# 依赖版本与构建逻辑见 ci/build-libmpv-macos.sh。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Install build tools
+        run: brew install meson ninja pkg-config nasm
+
+      - name: Checkout mpv (this repo)
+        uses: actions/checkout@v4
+
+      - name: Build universal libmpv.2.dylib
+        run: ./ci/build-libmpv-macos.sh universal
+
+      - name: Smoke test (dlopen + create/initialize)
+        run: |
+          cat > /tmp/smoke.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+              void *h = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+              if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+              unsigned (*ver)(void) = dlsym(h, "mpv_client_api_version");
+              void *(*create)(void) = dlsym(h, "mpv_create");
+              int (*init)(void *) = dlsym(h, "mpv_initialize");
+              void (*term)(void *) = dlsym(h, "mpv_terminate_destroy");
+              if (!ver || !create || !init || !term) return 2;
+              printf("client API %x\n", ver());
+              void *ctx = create();
+              if (!ctx) return 3;
+              if (init(ctx) < 0) return 4;
+              term(ctx);
+              printf("smoke OK\n");
+              return 0;
+          }
+          EOF
+          clang /tmp/smoke.c -o /tmp/smoke
+          /tmp/smoke dist/libmpv.2.dylib
+          # x86_64 切片通过 Rosetta 验证（runner 无 Rosetta 时跳过）
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            clang -arch x86_64 /tmp/smoke.c -o /tmp/smoke-x64
+            arch -x86_64 /tmp/smoke-x64 dist/libmpv.2.dylib
+          else
+            echo "runner 无 Rosetta，跳过 x86_64 冒烟测试"
+          fi
+
+      - name: Collect artifact
+        run: |
+          ls -lh dist/
+          lipo -info dist/libmpv.2.dylib
+          otool -L dist/libmpv.2.dylib
+
+      - name: Upload libmpv.2.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv.2.dylib-macos-universal
+          path: dist/libmpv.2.dylib
+          if-no-files-found: error
