@@ -1,18 +1,20 @@
 name: build-libmpv-windows
 
-# 构建 mpv-dev-x86_64-v3 包（libmpv-2.dll + libmpv.dll.a + 头文件，依赖全部
+# 构建 mpv-dev-x86_64 包（libmpv-2.dll + libmpv.dll.a + 头文件，依赖全部
 # 静态链接进 DLL）。构建流程与 shinchiro/mpv-winbuild-cmake 的
-# .github/workflows/mpv_clang.yml 保持一致（x86_64_v3 分支），仅保留以下差异：
-#   1. 只构建 x86_64-v3 一个架构，只上传 mpv-dev 包（不带播放器/调试包）
+# .github/workflows/mpv_clang.yml 保持一致（x86_64 分支），仅保留以下差异：
+#   1. 只构建 x86_64 基线架构（任何 64 位 CPU 可运行，面向大众分发最稳；
+#      如需 v3 微架构：configure 加 -DGCC_ARCH=x86-64-v3、BIT 改成
+#      x86_64_v3、目录/缓存键/artifact 名同步改名），只上传 mpv-dev 包
 #   2. mpv 源码指向本仓库（含杜比视界补丁），而不是上游 mpv-player/mpv
 #   3. libplacebo 锁定 v7.351.0（本补丁树验证过的版本）
 # 与上游相同的要点（之前失败的主因是对应项不一致）：
 #   - 容器用上游预构建镜像 ghcr.io/shinchiro/archlinux:latest，依赖版本与
 #     上游每日构建完全一致，不再手动 pacman 安装（Arch 滚动更新会引入漂移）
-#   - -DGCC_ARCH=x86-64-v3（v3 微架构，缺失时只是普通 x86-64 包）
+#   - 不加 -DGCC_ARCH，编译目标为基线 x86-64（与上游 64bit 包一致）
 #   - -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON（上游默认配置）
 #   - 缓存布局：clang_root（LLVM+rustup）/ src_packages（源码克隆）/
-#     build_x86_64_v3（工具链与构建树），构建结束后 rm -rf build/mpv* 与
+#     build_x86_64（工具链与构建树），构建结束后 rm -rf build/mpv* 与
 #     cargo-clean，mpv 每次运行都按当前提交全量重建
 # 需要强制重建工具链时，把 CACHE_VER 改成新字符串作废全部缓存。
 
@@ -31,19 +33,16 @@ permissions:
 
 jobs:
   build_mpv:
-    name: Building mpv-dev x86_64-v3
+    name: Building mpv-dev x86_64
     runs-on: ubuntu-latest
     container:
       image: docker://ghcr.io/shinchiro/archlinux:latest
     env:
-      BIT: x86_64_v3
+      BIT: x86_64
     steps:
-      # 对应上游 mpv_clang.yml 的 "Init variable"（x86_64_v3 分支）
+      # 对应上游 mpv_clang.yml 的 "Init variable"（x86_64 分支）
       - name: Init variable
-        run: |
-          echo "arch=x86_64" >> $GITHUB_ENV
-          echo "x86_64_level=-v3" >> $GITHUB_ENV
-          echo "x86_64_v3_ARCH=-DGCC_ARCH=x86-64-v3" >> $GITHUB_ENV
+        run: echo "arch=x86_64" >> $GITHUB_ENV
 
       - name: Setup git config
         run: |
@@ -78,12 +77,12 @@ jobs:
           key: ${{ env.CACHE_VER }}-repository-${{ github.run_id }}
           restore-keys: ${{ env.CACHE_VER }}-repository
 
-      - name: Loading x86_64_v3 toolchain cache
+      - name: Loading x86_64 toolchain cache
         uses: actions/cache/restore@v4
         with:
-          path: build_x86_64_v3
-          key: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain-${{ github.run_id }}
-          restore-keys: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain
+          path: build_x86_64
+          key: ${{ env.CACHE_VER }}-clang-x86_64_toolchain-${{ github.run_id }}
+          restore-keys: ${{ env.CACHE_VER }}-clang-x86_64_toolchain
 
       - name: Point mpv package source to this repo
         run: |
@@ -105,7 +104,7 @@ jobs:
       # 命令行与上游 mpv_clang.yml 完全一致，仅 -S 指向子目录 checkout
       - name: Configuring CMake & Downloading source
         run: |
-          cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang ${{ env.x86_64_v3_ARCH }} \
+          cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang \
             -DCMAKE_INSTALL_PREFIX=$PWD/clang_root \
             -DMINGW_INSTALL_PREFIX=$PWD/build_$BIT/$BIT-w64-mingw32 \
             -DSINGLE_SOURCE_LOCATION=$PWD/src_packages \
@@ -150,8 +149,8 @@ jobs:
       - name: Uploading mpv-dev package
         uses: actions/upload-artifact@v4
         with:
-          name: mpv-dev-x86_64_v3
-          path: release_x86_64_v3/
+          name: mpv-dev-x86_64
+          path: release_x86_64/
           if-no-files-found: error
 
       # 以下清理与缓存保存流程和上游 mpv_clang.yml 一致：mpv 的源码克隆之外
@@ -178,9 +177,9 @@ jobs:
           path: src_packages
           key: ${{ env.CACHE_VER }}-repository-${{ github.run_id }}
 
-      - name: Saving x86_64_v3 toolchain cache
+      - name: Saving x86_64 toolchain cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: build_x86_64_v3
-          key: ${{ env.CACHE_VER }}-clang-x86_64_v3_toolchain-${{ github.run_id }}
+          path: build_x86_64
+          key: ${{ env.CACHE_VER }}-clang-x86_64_toolchain-${{ github.run_id }}
