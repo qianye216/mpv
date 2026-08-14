@@ -299,6 +299,9 @@ bool upload_mp_image_to_pl_frame(struct ra_next *ra, struct pl_frame *out_frame,
     *out_frame = (struct pl_frame){
         .color = img->params.color,
         .repr = img->params.repr,
+        // mpv 的 video-rotate 通过帧的 params.rotate 传递（顺时针度数），
+        // 与 vo_gpu_next 一致换算为 libplacebo 的 90° 步进枚举
+        .rotation = img->params.rotate / 90,
         .crop = {
             .x0 = 0, .y0 = 0,
             .x1 = img->w, .y1 = img->h,
