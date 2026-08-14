@@ -44,6 +44,8 @@
 #include "options/options.h"
 #include "common/msg.h"
 #include "input/input.h"
+#include "misc/bstr.h"
+#include "misc/path_utils.h"
 #include "options/m_config.h"
 #include "options/path.h"
 #include "osdep/timer.h"
@@ -68,6 +70,11 @@ struct priv {
 
     int track;
     char *device;
+
+    // Remote ISO image backing stream (NULL for local devices/paths).
+    struct stream *src;
+    // Opened as a format probe: demote "wrong format" errors to verbose.
+    bool probe;
 
     struct dvd_opts *opts;
 };
@@ -539,12 +546,35 @@ static int control(stream_t *stream, int cmd, void *arg)
 static void stream_dvdnav_close(stream_t *s)
 {
     struct priv *priv = s->priv;
+    if (!priv)
+        return;
     if (priv->dvdnav)
         dvdnav_close(priv->dvdnav);
     priv->dvdnav = NULL;
     if (priv->dvd_speed)
         dvd_set_speed(s, priv->filename, -1);
+    if (priv->src) {
+        free_stream(priv->src);
+        priv->src = NULL;
+    }
 }
+
+#if HAVE_DVDNAV_STREAM
+// libdvdread byte-level stream callbacks (dvd_reader_stream_cb) used to play
+// ISO images over the stream layer. pf_readv is optional; libdvdread falls
+// back to pf_read.
+static int dvd_stream_cb_seek(void *p, uint64_t pos)
+{
+    struct priv *priv = p;
+    return stream_seek(priv->src, pos) ? 0 : -1;
+}
+
+static int dvd_stream_cb_read(void *p, void *buffer, int len)
+{
+    struct priv *priv = p;
+    return stream_read(priv->src, buffer, len);
+}
+#endif
 
 static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
 {
@@ -554,14 +584,48 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     if (!filename)
         return NULL;
 
-    if (!(priv->filename = mp_get_user_path(priv, stream->global, filename)))
-        return NULL;
+#if HAVE_DVDNAV_STREAM
+    if (mp_is_url(bstr0(filename))) {
+        // ISO image behind a URL: open it through the stream layer and hand
+        // it to libdvdnav via its stream callbacks. Requires a seekable
+        // source (HTTP range).
+        priv->src = stream_create(filename,
+                                  STREAM_READ | STREAM_ORIGIN_DIRECT |
+                                  STREAM_NO_ISO_DETECT,
+                                  stream->cancel, stream->global);
+        if (!priv->src) {
+            MP_MSG(stream, priv->probe ? MSGL_V : MSGL_ERR,
+                   "Failed to open ISO image: %s\n", filename);
+            return NULL;
+        }
+        if (!priv->src->seekable) {
+            MP_ERR(stream, "Remote ISO playback requires a source supporting "
+                   "range requests (server is not seekable): %s\n", filename);
+            return NULL;
+        }
 
-    priv->dvd_speed = priv->opts->speed;
-    dvd_set_speed(stream, priv->filename, priv->dvd_speed);
+        dvdnav_stream_cb stream_cb = {
+            .pf_seek = dvd_stream_cb_seek,
+            .pf_read = dvd_stream_cb_read,
+        };
+        if (dvdnav_open_stream(&(priv->dvdnav), priv, &stream_cb)
+                != DVDNAV_STATUS_OK) {
+            MP_MSG(stream, priv->probe ? MSGL_V : MSGL_ERR,
+                   "Couldn't open DVD image: %s\n", filename);
+            return NULL;
+        }
+    } else
+#endif
+    {
+        if (!(priv->filename = mp_get_user_path(priv, stream->global, filename)))
+            return NULL;
 
-    if (dvdnav_open(&(priv->dvdnav), priv->filename) != DVDNAV_STATUS_OK)
-        return NULL;
+        priv->dvd_speed = priv->opts->speed;
+        dvd_set_speed(stream, priv->filename, priv->dvd_speed);
+
+        if (dvdnav_open(&(priv->dvdnav), priv->filename) != DVDNAV_STATUS_OK)
+            return NULL;
+    }
 
     if (!priv->dvdnav)
         return NULL;
@@ -591,9 +655,9 @@ static int open_s_internal(stream_t *stream)
     else
         filename = DEFAULT_OPTICAL_DEVICE;
     if (!new_dvdnav_stream(stream, filename)) {
-        MP_ERR(stream, "Couldn't open DVD device: %s\n",
-                filename);
-        ret = STREAM_ERROR;
+        MP_MSG(stream, p->probe ? MSGL_V : MSGL_ERR,
+               "Couldn't open DVD device: %s\n", filename);
+        ret = p->probe ? STREAM_UNSUPPORTED : STREAM_ERROR;
         goto err;
     }
 
@@ -750,3 +814,33 @@ const stream_info_t stream_info_ifo_dvdnav = {
     .protocols = (const char*const[]){ "file", "", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
+
+// Open s as a DVD disc from a URL to an ISO image (or a local path).
+// Called by the ISO image auto-detection (stream_iso.c). Returns
+// STREAM_UNSUPPORTED if the source is not a DVD-Video disc, so the caller can
+// try other formats.
+int mp_dvdnav_open_disc_url(stream_t *s, const char *url)
+{
+#if HAVE_DVDNAV_STREAM
+    struct priv *priv = talloc_zero(s, struct priv);
+    s->priv = priv;
+
+    struct MPOpts *opts = mp_get_config_group(s, s->global, &mp_opt_root);
+    priv->track = opts->edition_id >= 0 ? opts->edition_id : TITLE_LONGEST;
+    talloc_free(opts);
+
+    priv->probe = true;
+    priv->device = talloc_strdup(priv, url);
+
+    int r = open_s_internal(s);
+    if (r != STREAM_OK) {
+        // open_s_internal() already cleaned up libdvdnav state.
+        talloc_free(priv);
+        s->priv = NULL;
+    }
+    return r;
+#else
+    MP_ERR(s, "Streaming DVD ISO images requires libdvdnav >= 5.0.3.\n");
+    return STREAM_UNSUPPORTED;
+#endif
+}

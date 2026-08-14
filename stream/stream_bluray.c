@@ -41,6 +41,8 @@
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "common/msg.h"
+#include "misc/bstr.h"
+#include "misc/path_utils.h"
 #include "options/m_config.h"
 #include "options/options.h"
 #include "options/path.h"
@@ -100,6 +102,11 @@ struct bluray_priv_s {
     int cfg_playlist;
     char *cfg_device;
 
+    // Remote ISO image backing stream (NULL for local devices/paths).
+    struct stream *src;
+    // Opened as a format probe: demote "wrong format" errors to verbose.
+    bool probe;
+
     struct mp_bluray_opts *opts;
     struct m_config_cache *opts_cache;
 };
@@ -114,6 +121,26 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
+// UDF/logical block size used by libbluray's block device interface
+// (bd_open_stream). ISO images are dumps of such blocks.
+#define BD_BLOCK_SIZE 2048
+
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 8, 0)
+// libbluray callback: read num_blocks 2048-byte blocks at logical block
+// address lba from the remote ISO image.
+static int bd_stream_read_blocks(void *handle, void *buf, int lba, int num_blocks)
+{
+    struct stream *src = handle;
+
+    if (!stream_seek(src, (int64_t)lba * BD_BLOCK_SIZE))
+        return -1;
+
+    // stream_read() fills the whole buffer unless EOF is hit.
+    int64_t res = stream_read(src, buf, (int64_t)num_blocks * BD_BLOCK_SIZE);
+    return (int)(res / BD_BLOCK_SIZE);
+}
+#endif
+
 static void bluray_stream_close(stream_t *s)
 {
     struct bluray_priv_s *priv = s->priv;
@@ -122,8 +149,13 @@ static void bluray_stream_close(stream_t *s)
 
     if (priv->title_info)
         bd_free_title_info(priv->title_info);
+    priv->title_info = NULL;
     if (priv->bd)
         bd_close(priv->bd);
+    priv->bd = NULL;
+    if (priv->src)
+        free_stream(priv->src);
+    priv->src = NULL;
 }
 
 static void handle_event(stream_t *s, const BD_EVENT *ev)
@@ -343,26 +375,26 @@ static const char *aacs_strerr(int err)
     }
 }
 
-static bool check_disc_info(stream_t *s)
+static int check_disc_info(stream_t *s)
 {
     struct bluray_priv_s *b = s->priv;
     const BLURAY_DISC_INFO *info = bd_get_disc_info(b->bd);
 
     // check Blu-ray
     if (!info->bluray_detected) {
-        MP_ERR(s, "Given stream is not a Blu-ray.\n");
-        return false;
+        MP_MSG(s, b->probe ? MSGL_V : MSGL_ERR, "Given stream is not a Blu-ray.\n");
+        return STREAM_UNSUPPORTED;
     }
 
     // check AACS
     if (info->aacs_detected) {
         if (!info->libaacs_detected) {
             MP_ERR(s, "AACS encryption detected but cannot find libaacs.\n");
-            return false;
+            return STREAM_ERROR;
         }
         if (!info->aacs_handled) {
             MP_ERR(s, "AACS error: %s\n", aacs_strerr(info->aacs_error_code));
-            return false;
+            return STREAM_ERROR;
         }
     }
 
@@ -370,15 +402,15 @@ static bool check_disc_info(stream_t *s)
     if (info->bdplus_detected) {
         if (!info->libbdplus_detected) {
             MP_ERR(s, "BD+ encryption detected but cannot find libbdplus.\n");
-            return false;
+            return STREAM_ERROR;
         }
         if (!info->bdplus_handled) {
             MP_ERR(s, "Cannot decrypt BD+ encryption.\n");
-            return false;
+            return STREAM_ERROR;
         }
     }
 
-    return true;
+    return STREAM_OK;
 }
 
 static void select_initial_title(stream_t *s, int title_guess) {
@@ -437,26 +469,65 @@ static int bluray_stream_open_internal(stream_t *s)
         bd_set_debug_mask(0);
 
     /* open device */
-    char *device_tmp = mp_get_user_path(NULL, s->global, device);
-    BLURAY *bd = bd_open(device_tmp, NULL);
-    talloc_free(device_tmp);
-    if (!bd) {
-        MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
-        ret = STREAM_UNSUPPORTED;
-        goto err;
+    BLURAY *bd = NULL;
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 8, 0)
+    if (b->src || mp_is_url(bstr0(device))) {
+        // ISO image behind a URL: open it through the stream layer and serve
+        // its blocks to libbluray. Requires a seekable source (HTTP range).
+        if (!b->src) {
+            b->src = stream_create(device,
+                                   STREAM_READ | STREAM_ORIGIN_DIRECT |
+                                   STREAM_NO_ISO_DETECT,
+                                   s->cancel, s->global);
+            if (!b->src) {
+                MP_MSG(s, b->probe ? MSGL_V : MSGL_ERR,
+                       "Failed to open ISO image: %s\n", device);
+                ret = STREAM_UNSUPPORTED;
+                goto err;
+            }
+            if (!b->src->seekable) {
+                MP_ERR(s, "Remote ISO playback requires a source supporting "
+                       "range requests (server is not seekable): %s\n", device);
+                ret = STREAM_ERROR;
+                goto err;
+            }
+        }
+
+        bd = bd_init();
+        if (!bd || !bd_open_stream(bd, b->src, bd_stream_read_blocks)) {
+            if (bd)
+                bd_close(bd);
+            bd = NULL;
+            MP_MSG(s, b->probe ? MSGL_V : MSGL_ERR,
+                   "Couldn't open Blu-ray image: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+    } else
+#endif
+    {
+        char *device_tmp = mp_get_user_path(NULL, s->global, device);
+        bd = bd_open(device_tmp, NULL);
+        talloc_free(device_tmp);
+        if (!bd) {
+            MP_MSG(s, b->probe ? MSGL_V : MSGL_ERR,
+                   "Couldn't open Blu-ray device: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
     }
     b->bd = bd;
 
-    if (!check_disc_info(s)) {
-        ret = STREAM_UNSUPPORTED;
+    ret = check_disc_info(s);
+    if (ret != STREAM_OK)
         goto err;
-    }
 
     /* check for available titles on disc */
     b->num_titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
     if (!b->num_titles) {
-        MP_ERR(s, "Can't find any Blu-ray-compatible title here.\n");
-        ret = STREAM_UNSUPPORTED;
+        MP_MSG(s, b->probe ? MSGL_V : MSGL_ERR,
+               "Can't find any Blu-ray-compatible title here.\n");
+        ret = STREAM_ERROR;
         goto err;
     }
 
@@ -656,3 +727,34 @@ const stream_info_t stream_info_bdmv_dir = {
     .protocols = (const char*const[]){ "file", "", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
+
+// Open s as a Blu-ray disc from a URL to an ISO image (or a local path).
+// Called by the ISO image auto-detection (stream_iso.c). Returns
+// STREAM_UNSUPPORTED if the source is not a Blu-ray disc, so the caller can
+// try other formats.
+int mp_bluray_open_disc_url(stream_t *s, const char *url)
+{
+#if BLURAY_VERSION >= BLURAY_VERSION_CODE(0, 8, 0)
+    struct bluray_priv_s *priv = talloc_zero(s, struct bluray_priv_s);
+    s->priv = priv;
+
+    struct MPOpts *opts = mp_get_config_group(s, s->global, &mp_opt_root);
+    priv->cfg_title = opts->edition_id >= 0 ? opts->edition_id
+                                            : BLURAY_DEFAULT_TITLE;
+    talloc_free(opts);
+
+    priv->probe = true;
+    priv->cfg_device = talloc_strdup(priv, url);
+
+    int r = bluray_stream_open_internal(s);
+    if (r != STREAM_OK) {
+        // bluray_stream_open_internal() already cleaned up libbluray state.
+        talloc_free(priv);
+        s->priv = NULL;
+    }
+    return r;
+#else
+    MP_ERR(s, "Streaming Blu-ray ISO images requires libbluray >= 0.8.0.\n");
+    return STREAM_UNSUPPORTED;
+#endif
+}

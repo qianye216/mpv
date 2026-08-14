@@ -668,6 +668,10 @@ dvdnav_opt = get_option('dvdnav').require(
 )
 dvdnav = dependency('dvdnav', version: '>= 4.2.0', required: dvdnav_opt)
 features += {'dvdnav': dvdnav.found()}
+# dvdnav_open_stream() for playing ISO images through mpv's stream layer.
+# If the version is unknown, assume it is new enough (anything from 2015 on).
+features += {'dvdnav-stream': dvdnav.found() and (
+    dvdnav.version() == '' or dvdnav.version().version_compare('>= 5.0.3'))}
 if features['dvdnav']
     dependencies += dvdnav
     sources += files('stream/stream_dvdnav.c')
@@ -713,6 +717,11 @@ features += {'libbluray': libbluray.found()}
 if features['libbluray']
     dependencies += libbluray
     sources += files('stream/stream_bluray.c')
+endif
+
+# ISO image auto-detection (opens .iso URLs/files as Blu-ray or DVD discs).
+if features['libbluray'] or features['dvdnav']
+    sources += files('stream/stream_iso.c')
 endif
 
 libm = cc.find_library('m', required: false)

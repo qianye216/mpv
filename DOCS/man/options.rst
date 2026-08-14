@@ -3927,14 +3927,22 @@ Disc Devices
     from a DVD (with e.g. vobcopy). The default device path depends on
     the OS. See the `OPTICAL DRIVES`_ section.
 
+    This can also be a URL to an ISO image (e.g. ``http://`` or
+    ``webdav://``); the image is then streamed with HTTP range requests,
+    which requires the server to support them.
+
     .. admonition:: Example
 
         ``mpv dvd:// --dvd-device=/path/to/dvd/``
 
 ``--bluray-device=<path>``
     Specify the Blu-ray disc location. Must be a directory with Blu-ray
-    structure. The default device path depends on the OS. See the
-    `OPTICAL DRIVES`_ section.
+    structure, or an ISO image file (local or a URL). The default device path
+    depends on the OS. See the `OPTICAL DRIVES`_ section.
+
+    This can also be a URL to an ISO image (e.g. ``http://`` or
+    ``webdav://``); the image is then streamed with HTTP range requests,
+    which requires the server to support them.
 
     .. admonition:: Example
 

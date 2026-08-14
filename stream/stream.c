@@ -59,6 +59,7 @@ extern const stream_info_t stream_info_dvdnav;
 extern const stream_info_t stream_info_bdmv_dir;
 extern const stream_info_t stream_info_bluray;
 extern const stream_info_t stream_info_edl;
+extern const stream_info_t stream_info_iso;
 extern const stream_info_t stream_info_libarchive;
 extern const stream_info_t stream_info_cb;
 extern const stream_info_t stream_info_curl;
@@ -80,6 +81,9 @@ static const stream_info_t *const stream_list[] = {
 #if HAVE_LIBBLURAY
     &stream_info_bdmv_dir,
     &stream_info_bluray,
+#endif
+#if HAVE_LIBBLURAY || HAVE_DVDNAV
+    &stream_info_iso,
 #endif
 #if HAVE_LIBARCHIVE
     &stream_info_libarchive,
@@ -337,6 +341,10 @@ static int stream_create_instance(const stream_info_t *sinfo,
     if (flags & STREAM_LOCAL_FS_ONLY) {
         if (!sinfo->local_fs)
             return STREAM_NO_MATCH;
+    } else if ((flags & STREAM_NO_ISO_DETECT) && sinfo == &stream_info_iso) {
+        // Disc backends opening an ISO image as their data source must not
+        // re-enter the ISO auto-detection.
+        return STREAM_NO_MATCH;
     } else {
         char **get_protocols = sinfo->get_protocols ? sinfo->get_protocols() : NULL;
         char **protocols = get_protocols ? get_protocols : (char **)sinfo->protocols;

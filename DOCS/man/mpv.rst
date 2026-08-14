@@ -1325,7 +1325,10 @@ PROTOCOLS
 ``bd://[title][/device]`` ``--bluray-device=PATH``
 
     Play a Blu-ray disc. Since libbluray 1.0.1, you can read from ISO files
-    by passing them to ``--bluray-device``.
+    by passing them to ``--bluray-device``. The device can also be a URL to
+    an ISO image (e.g. ``--bluray-device=http://server/movie.iso``); the
+    image is then streamed with HTTP range requests, which requires the
+    server to support them.
 
     ``title`` can be: ``longest`` or ``first`` (selects the default
     playlist); ``mpls/<number>`` (selects <number>.mpls playlist);
@@ -1339,9 +1342,20 @@ PROTOCOLS
     Play a DVD. DVD menus are not supported. If no title is given, the longest
     title is auto-selected. Without ``--dvd-device``, it will probably try
     to open an actual optical drive, if available and implemented for the OS.
+    As with ``--bluray-device``, the device can also be a URL to an ISO
+    image, which is streamed with HTTP range requests.
 
     ``dvdnav://`` is an old alias for ``dvd://`` and does exactly the same
     thing.
+
+``http://server/movie.iso`` (ISO image auto-detection)
+
+    URLs (and local files) whose name ends in ``.iso`` or ``.img`` are
+    automatically opened as optical discs: the image is first probed as a
+    Blu-ray (Blu-ray structure detected) and, failing that, as a DVD-Video.
+    If it is neither, playback falls back to normal file handling (e.g.
+    libarchive). Playing a remote image requires the server to support
+    HTTP range requests.
 
 ``dvb://[cardnumber@]channel`` ``--dvbin-...``
 

@@ -53,6 +53,9 @@
 #define STREAM_LOCAL_FS_ONLY      (1 << 5) // stream_file only, no URLs
 #define STREAM_LESS_NOISE         (1 << 6) // try to log errors only
 #define STREAM_ALLOW_PARTIAL_READ (1 << 7) // allows partial read with stream_read_file()
+#define STREAM_NO_ISO_DETECT      (1 << 8) // skip .iso disc image auto-detection
+                                           // (used when disc backends open an ISO
+                                           //  image itself as a data source)
 
 // Default flags used by stream_read_file().
 #define STREAM_READ_FILE_FLAGS_DEFAULT \
@@ -262,6 +265,13 @@ stream_t *open_output_stream(const char *filename, struct mpv_global *global);
 void mp_url_unescape_inplace(char *buf);
 char *mp_url_unescape(void *talloc_ctx, const char *url);
 char *mp_url_escape(void *talloc_ctx, const char *s, const char *ok);
+
+// stream_bluray.c / stream_dvdnav.c: open a disc image from a URL (or local
+// path) as a disc. Used by ISO image auto-detection (stream_iso.c). Returns
+// STREAM_UNSUPPORTED if the source is not that kind of disc.
+// Available when HAVE_LIBBLURAY / HAVE_DVDNAV, respectively.
+int mp_bluray_open_disc_url(stream_t *s, const char *url);
+int mp_dvdnav_open_disc_url(stream_t *s, const char *url);
 
 // stream_memory.c
 struct stream *stream_memory_open(struct mpv_global *global, void *data, int len);
