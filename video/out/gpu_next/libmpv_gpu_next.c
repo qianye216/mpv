@@ -136,7 +136,11 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (!target_tex) return MPV_ERROR_GENERIC;
 
     // Render the video frame.
-    pl_video_render(p->video_engine, frame, target_tex);
+    // Honor MPV_RENDER_PARAM_FLIP_Y (same semantics as the legacy gpu backend:
+    // hosts rendering into an FBO, e.g. Qt, typically need the vertical flip).
+    bool flip_y = *(int *)get_mpv_render_param(params, MPV_RENDER_PARAM_FLIP_Y,
+                                               &(int){0});
+    pl_video_render(p->video_engine, frame, target_tex, flip_y);
 
     // Destroy the temporary wrapper texture via the RA.
     ra_next_tex_destroy(p->context->ra, &target_tex);
