@@ -69,6 +69,12 @@ ninja -C build_x86_64 download || true
 
 # Building mpv + Packaging mpv-dev
 ninja -C build_x86_64 update
+# libplacebo v7.351.0 的 utils_gen.py 与镜像 Python 3.14 不兼容，构建前打一行
+# 补丁（等价于上游 haasn/libplacebo@12509c0f1e；必须在 update 之后，force-update
+# 会 git reset --hard 还原源码树，每次运行重打是幂等的；详见 workflow 内注释）
+sed -i 's|VkXML(ET.parse(xmlfile))|VkXML(ET.parse(xmlfile).getroot())|' \
+  src_packages/libplacebo/src/vulkan/utils_gen.py
+grep -n 'registry = VkXML' src_packages/libplacebo/src/vulkan/utils_gen.py
 # 从零自举先建 LLVM 再建其余工具链：包 configure 用的
 # x86_64-w64-mingw32-gcc 包装脚本背后是 clang_root/bin/clang，
 # 不先建好 llvm 的话 zlib 等最早的包 configure 会全部失败；

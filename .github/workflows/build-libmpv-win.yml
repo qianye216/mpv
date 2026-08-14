@@ -13,6 +13,9 @@ name: build-libmpv-windows
 #      而它与 llvm 无依赖边、并行调度时包 configure 会先于 LLVM 就绪
 #      （libiconv configure 退出码 77 即此症状）。上游不需要这两步是因为
 #      其 clang_root 缓存由 llvm_clang.yml workflow 预热，从不真正从零构建
+#   5. libplacebo v7.351.0 的 utils_gen.py 与镜像里的 Python 3.14 不兼容
+#      （ElementTree.__init__ 新增类型校验），构建前打一行补丁，等价于
+#      上游修复 haasn/libplacebo@12509c0f1e（该修复不在任何 v7.351.x 里）
 # 与上游相同的要点（之前失败的主因是对应项不一致）：
 #   - 容器用上游预构建镜像 ghcr.io/shinchiro/archlinux:latest，依赖版本与
 #     上游每日构建完全一致，不再手动 pacman 安装（Arch 滚动更新会引入漂移）
@@ -121,6 +124,13 @@ jobs:
       - name: Building mpv
         run: |
           ninja -C build_$BIT update
+          # libplacebo v7.351.0 的 utils_gen.py 把 ElementTree 对象当 Element 传，
+          # 镜像滚动到 Python 3.14 后新增的类型校验直接 TypeError（见文件头注释
+          # 第 5 点）。必须放在 update 之后：force-update 的 git reset --hard 会
+          # 还原源码树；install 后的 postremovebuild 也会还原，每次运行重打是幂等的
+          sed -i 's|VkXML(ET.parse(xmlfile))|VkXML(ET.parse(xmlfile).getroot())|' \
+            src_packages/libplacebo/src/vulkan/utils_gen.py
+          grep -n 'registry = VkXML' src_packages/libplacebo/src/vulkan/utils_gen.py
           # 从零自举必须先建 LLVM 本体再建其余工具链（见文件头注释第 4 点）；
           # 缓存命中时 stamps 已在 build 树里，这两条是秒级 no-op
           ninja -C build_$BIT llvm
