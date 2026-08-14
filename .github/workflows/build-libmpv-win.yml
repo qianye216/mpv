@@ -4,7 +4,8 @@ name: build-libmpv-windows
 # 交叉编译体系使用 shinchiro/mpv-winbuild-cmake（Arch 容器 + clang/LLVM 交叉工具链），
 # mpv 源码指向本仓库（含杜比视界补丁），产物为静态链接的独立 DLL。
 # 注意：上游 gcc 工具链路径已失修（mpv_gcc.yml CI 自 2026-06 起连续失败），
-# 必须使用 clang/lld（mpv_clang.yml CI 每日构建验证通过）。
+# 必须使用 clang/lld。上游 mpv_clang.yml 每日构建依赖 clang_root 缓存（工具链
+# 由 llvm_clang.yml 预构建）；本 workflow 无缓存从零构建，须先 ninja llvm。
 
 on:
   workflow_dispatch:
@@ -66,7 +67,16 @@ jobs:
         run: ninja -C build64 download || true
 
       - name: Build LLVM/MinGW toolchain
-        run: ninja -C build64 llvm-clang
+        run: |
+          # 必须先构建 LLVM 本体（ninja llvm）装出 build64/install/bin/clang：
+          # mingw-w64-crt 的 x86_64-w64-mingw32-gcc 是 llvm-wrapper 生成的
+          # 包装脚本，内部调用 ${CMAKE_INSTALL_PREFIX}/bin/clang；而 ep 依赖
+          # 顺序里 crt 在 llvm 之前，伞目标 llvm-clang 假定 clang 已存在
+          # （上游 llvm_clang.yml 先 ninja llvm 再 ninja llvm-clang，靠
+          # clang_root 缓存跨 run 复用）。跳过此步会导致 crt configure 报
+          # "cannot compute suffix of object files: cannot compile"
+          ninja -C build64 llvm
+          ninja -C build64 llvm-clang
 
       - name: Install rustup (rav1e 等 Rust 依赖需要)
         run: |
