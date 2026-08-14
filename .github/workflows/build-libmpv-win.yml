@@ -1,8 +1,10 @@
 name: build-libmpv-windows
 
 # 构建 Windows 单文件静态 mpv-2.dll（含 gpu-next render backend，支持杜比视界）。
-# 交叉编译体系使用 shinchiro/mpv-winbuild-cmake（Arch 容器 + MinGW 交叉工具链），
+# 交叉编译体系使用 shinchiro/mpv-winbuild-cmake（Arch 容器 + clang/LLVM 交叉工具链），
 # mpv 源码指向本仓库（含杜比视界补丁），产物为静态链接的独立 DLL。
+# 注意：上游 gcc 工具链路径已失修（mpv_gcc.yml CI 自 2026-06 起连续失败），
+# 必须使用 clang/lld（mpv_clang.yml CI 每日构建验证通过）。
 
 on:
   workflow_dispatch:
@@ -50,24 +52,11 @@ jobs:
             mpv-winbuild-cmake/packages/libplacebo.cmake
           grep -n "GIT_REPOSITORY\|GIT_CLONE\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
 
-      - name: Work around ngtcp2 configure failure with GNU ld
-        run: |
-          # ngtcp2 配方（上游 2026-08 合入，未经 gcc 工具链验证）把 -lz/-lzstd/-lbrotli*
-          # 塞进 CMAKE_C_FLAGS，位于 try_compile 链接命令行最前；GNU ld 单趟扫描不回溯
-          # 左侧静态库，导致 OpenSSL QUIC 检测（SSL_set_quic_tls_cbs，链接静态
-          # libssl/libcrypto 需要 zstd/brotli/z）失败并触发 FATAL_ERROR。
-          # lld 支持回溯所以 clang 工具链不受影响。
-          # 预置检测结果可跳过该 try_compile（check_symbol_exists 对已定义的缓存变量直接采信）；
-          # openssl.cmake 锁定的是 openssl master（>=3.5），本就提供 SSL_set_quic_tls_cbs，预置值属实。
-          sed -i 's|-DBUILD_TESTING=OFF|-DBUILD_TESTING=OFF\n        -DHAVE_SSL_SET_QUIC_TLS_CBS=TRUE|' \
-            mpv-winbuild-cmake/packages/ngtcp2.cmake
-          grep -n "HAVE_SSL_SET_QUIC_TLS_CBS" mpv-winbuild-cmake/packages/ngtcp2.cmake
-
       - name: Configure
         run: |
           cmake -Wno-dev --fresh \
             -DTARGET_ARCH=x86_64-w64-mingw32 \
-            -DCOMPILER_TOOLCHAIN=gcc \
+            -DCOMPILER_TOOLCHAIN=clang \
             -DENABLE_CCACHE=OFF \
             -DSINGLE_SOURCE_LOCATION=${GITHUB_WORKSPACE}/src_packages \
             -DRUSTUP_LOCATION=${GITHUB_WORKSPACE}/install_rustup \
@@ -76,8 +65,8 @@ jobs:
       - name: Download package sources
         run: ninja -C build64 download || true
 
-      - name: Build MinGW toolchain
-        run: ninja -C build64 gcc
+      - name: Build LLVM/MinGW toolchain
+        run: ninja -C build64 llvm-clang
 
       - name: Install rustup (rav1e 等 Rust 依赖需要)
         run: |
@@ -87,15 +76,33 @@ jobs:
       - name: Build mpv
         run: ninja -C build64 mpv
 
+      - name: Dump failed package logs
+        if: failure()
+        run: |
+          # 包配方的 LOG_CONFIGURE/LOG_BUILD=1 会把真实报错吞进 stamp 日志文件，
+          # Actions 日志只能看到退出码；失败时把 configure/build/install 日志
+          # 末尾打出来，避免再次盲排
+          find build64 -path '*-stamp/*-configure-*.log' \
+                      -o -path '*-stamp/*-build-*.log' \
+                      -o -path '*-stamp/*-install-*.log' 2>/dev/null \
+            | while read -r f; do
+                echo "===== $f ====="
+                tail -c 20000 "$f"
+                echo
+              done
+
       - name: Collect artifact
         run: |
           mkdir -p dist
           cp build64/mpv-dev-*/libmpv-2.dll dist/libmpv-2.dll
-          ls -lh dist/libmpv-2.dll
+          # 上游 2026-08 起 vulkan loader 改为动态链接（KhronosGroup/Vulkan-Loader#1538），
+          # libmpv-2.dll 运行时依赖 vulkan-1.dll，一并收集（存在才收）
+          find build64 -name 'vulkan-1.dll' -not -path '*/dist/*' -exec cp {} dist/ \; 2>/dev/null || true
+          ls -lh dist/
 
       - name: Upload libmpv-2.dll
         uses: actions/upload-artifact@v4
         with:
           name: libmpv-2.dll-windows-x86_64
-          path: dist/libmpv-2.dll
+          path: dist/
           if-no-files-found: error
