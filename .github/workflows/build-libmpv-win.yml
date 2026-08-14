@@ -8,6 +8,11 @@ name: build-libmpv-windows
 #      x86_64_v3、目录/缓存键/artifact 名同步改名），只上传 mpv-dev 包
 #   2. mpv 源码指向本仓库（含杜比视界补丁），而不是上游 mpv-player/mpv
 #   3. libplacebo 锁定 v7.351.0（本补丁树验证过的版本）
+#   4. 从零构建时先 ninja llvm / llvm-clang 再 ninja mpv：包配方用的
+#      x86_64-w64-mingw32-gcc 是包装脚本，背后调用 clang_root/bin/clang，
+#      而它与 llvm 无依赖边、并行调度时包 configure 会先于 LLVM 就绪
+#      （libiconv configure 退出码 77 即此症状）。上游不需要这两步是因为
+#      其 clang_root 缓存由 llvm_clang.yml workflow 预热，从不真正从零构建
 # 与上游相同的要点（之前失败的主因是对应项不一致）：
 #   - 容器用上游预构建镜像 ghcr.io/shinchiro/archlinux:latest，依赖版本与
 #     上游每日构建完全一致，不再手动 pacman 安装（Arch 滚动更新会引入漂移）
@@ -116,6 +121,10 @@ jobs:
       - name: Building mpv
         run: |
           ninja -C build_$BIT update
+          # 从零自举必须先建 LLVM 本体再建其余工具链（见文件头注释第 4 点）；
+          # 缓存命中时 stamps 已在 build 树里，这两条是秒级 no-op
+          ninja -C build_$BIT llvm
+          ninja -C build_$BIT llvm-clang
           ninja -C build_$BIT mpv
 
       - name: Packaging mpv-dev
