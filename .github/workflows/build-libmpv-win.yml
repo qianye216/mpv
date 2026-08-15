@@ -104,6 +104,17 @@ jobs:
           sed -i 's|GIT_REPOSITORY https://github.com/haasn/libplacebo.git|GIT_REPOSITORY https://github.com/haasn/libplacebo.git\n    GIT_TAG v7.351.0|' \
             mpv-winbuild-cmake/packages/libplacebo.cmake
           grep -n "GIT_REPOSITORY\|GIT_CLONE_FLAGS\|GIT_TAG" mpv-winbuild-cmake/packages/mpv.cmake mpv-winbuild-cmake/packages/libplacebo.cmake || true
+          # subrandr 是唯一的 Rust 包，CLANG_PACKAGES_LTO 下以
+          # linker-plugin-lto + embed-bitcode 输出 LLVM bitcode，其版本跟随
+          # rustup nightly（当前 LLVM 23.1.0），而工具链 lld 固定 release/22.x，
+          # 主版本不一致时链接 libmpv-2.dll 报 "ld.lld: error: Not an int
+          # attribute"。删掉 LTO 注入让它输出原生对象（字幕渲染器性能损失可
+          # 忽略），从此免疫 nightly 与工具链的 LLVM 版本漂移
+          sed -i '/cargo_lto_rustflags/d' mpv-winbuild-cmake/packages/subrandr.cmake
+          if grep -q 'cargo_lto_rustflags' mpv-winbuild-cmake/packages/subrandr.cmake; then
+            echo 'subrandr LTO 补丁未生效，上游配方可能已改动' >&2
+            exit 1
+          fi
           # mpv 的远端是本地路径（本仓库的 checkout），force-update 里硬编码的
           # git fetch --filter=tree:0 对本地远端不可靠；删除旧克隆，让 download
           # 步骤按本次触发的提交重新克隆（mpv 体积小，代价可忽略）
