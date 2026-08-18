@@ -16,6 +16,14 @@ name: build-libmpv-windows
 #   5. libplacebo v7.351.0 的 utils_gen.py 与镜像里的 Python 3.14 不兼容
 #      （ElementTree.__init__ 新增类型校验），构建前打一行补丁，等价于
 #      上游修复 haasn/libplacebo@12509c0f1e（该修复不在任何 v7.351.x 里）
+#   6. 还原 Vulkan 静态 loader（ci/winbuild-overrides/vulkan-restore-
+#      static-loader.patch，revert 上游 5f773c9"vulkan: disable static
+#      loader"，该提交 2026-08-04 起把 loader 改回动态）。动态方案下
+#      libmpv-2.dll 硬依赖 vulkan-1.dll，无 Vulkan 驱动的 Windows 机器
+#      （System32 无 vulkan-1.dll）LoadLibrary 直接失败、播放器不可用；
+#      静态 loader 让 libmpv 自包含。同时清掉缓存里动态时期安装的
+#      libvulkan.dll.a / vulkan-1.dll（MinGW 链接器 dll.a 优先于 .a，
+#      残留会让补丁静默失效）
 # 与上游相同的要点（之前失败的主因是对应项不一致）：
 #   - 容器用上游预构建镜像 ghcr.io/shinchiro/archlinux:latest，依赖版本与
 #     上游每日构建完全一致，不再手动 pacman 安装（Arch 滚动更新会引入漂移）
@@ -119,6 +127,20 @@ jobs:
           # git fetch --filter=tree:0 对本地远端不可靠；删除旧克隆，让 download
           # 步骤按本次触发的提交重新克隆（mpv 体积小，代价可忽略）
           rm -rf src_packages/mpv
+          # 还原 Vulkan 静态 loader（见文件头注释第 6 点）。打完必须 grep 校验，
+          # 上游再改 packages/vulkan.cmake 时在这里立刻失败，避免静默产出
+          # 依赖系统 vulkan-1.dll 的 libmpv
+          git -C mpv-winbuild-cmake am --3way ci/winbuild-overrides/vulkan-restore-static-loader.patch
+          grep -q 'BUILD_STATIC_LOADER=ON' mpv-winbuild-cmake/packages/vulkan.cmake || {
+            echo 'vulkan static-loader patch failed to apply' >&2
+            exit 1
+          }
+          # 清理动态链接时期（上游 5f773c9 之后）留在缓存里的 vulkan 产物：
+          # libvulkan.dll.a 会让 -lvulkan 静默选回动态导入库；vulkan-prefix/
+          # src_packages/vulkan 删掉以强制 vulkan 包按静态配方重装
+          rm -rf src_packages/vulkan build_$BIT/vulkan-prefix
+          rm -fv build_$BIT/$BIT-w64-mingw32/lib/libvulkan.dll.a \
+                  build_$BIT/$BIT-w64-mingw32/bin/vulkan-1.dll
 
       # 命令行与上游 mpv_clang.yml 完全一致，仅 -S 指向子目录 checkout
       - name: Configuring CMake & Downloading source
@@ -155,8 +177,9 @@ jobs:
           # 只取 mpv-dev 包（含 libmpv-2.dll / libmpv.dll.a / include/），
           # 播放器与 debug 包留在构建树里随清理步骤丢弃
           mv build_$BIT/mpv-dev-*.7z release_$BIT/
-          # 上游 2026-08 起 vulkan loader 改为动态链接（KhronosGroup/Vulkan-Loader#1538），
-          # libmpv-2.dll 运行时依赖 vulkan-1.dll，一并收集（存在才收）
+          # 兜底收集：静态 loader 生效后产物不应再出现 vulkan-1.dll；万一
+          # 补丁失效漂移回动态链接，也把 vulkan-1.dll 带出（存在才收），
+          # 供应用侧随 libmpv-2.dll 一起分发
           find build_$BIT -name 'vulkan-1.dll' -exec cp {} release_$BIT/ \; 2>/dev/null || true
           ls -lh release_$BIT/
 

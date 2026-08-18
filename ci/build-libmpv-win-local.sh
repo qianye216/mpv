@@ -66,6 +66,19 @@ fi
 # 每次删旧克隆、按挂载进来的当前提交重新克隆
 rm -rf src_packages/mpv
 
+# 还原 Vulkan 静态 loader（对应 mpv-winbuild 的 patch/0001，revert 上游
+# 5f773c9）：动态方案下 libmpv-2.dll 硬依赖 vulkan-1.dll，无 Vulkan 驱动的
+# Windows 机器（System32 里没有 vulkan-1.dll）LoadLibrary 直接失败。静态
+# loader 让 libmpv 自包含，与 CI 产物形态一致；上游再改 vulkan.cmake 时
+# git am 失败会立刻中断脚本，需要同步 rebase 补丁
+git -C mpv-winbuild-cmake am --3way /work/mpv/ci/winbuild-overrides/vulkan-restore-static-loader.patch
+grep -q 'BUILD_STATIC_LOADER=ON' mpv-winbuild-cmake/packages/vulkan.cmake
+# 清理 volume 缓存里动态链接时期（上游 5f773c9 之后）的 vulkan 产物：
+# libvulkan.dll.a 会让 -lvulkan 静默选回动态导入库，vulkan 包也强制重装
+rm -rf src_packages/vulkan build_x86_64/vulkan-prefix
+rm -fv build_x86_64/x86_64-w64-mingw32/lib/libvulkan.dll.a \
+        build_x86_64/x86_64-w64-mingw32/bin/vulkan-1.dll
+
 # Configuring CMake & Downloading source（命令行与 workflow 完全一致）
 cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang \
   -DCMAKE_INSTALL_PREFIX=/work/clang_root \
@@ -94,7 +107,8 @@ ninja -C build_x86_64 mpv
 ninja -C build_x86_64 mpv-packaging
 
 mv build_x86_64/mpv-dev-*.7z release_x86_64/
-# libmpv-2.dll 运行时依赖 vulkan-1.dll，一并收集（存在才收）
+# 兜底收集：静态 loader 生效后产物不应再出现 vulkan-1.dll；万一上游/补丁
+# 漂移回动态链接，也把 vulkan-1.dll 一起带出 dist/（存在才收）
 find build_x86_64 -name 'vulkan-1.dll' -exec cp {} release_x86_64/ \; 2>/dev/null || true
 ls -lh release_x86_64/
 

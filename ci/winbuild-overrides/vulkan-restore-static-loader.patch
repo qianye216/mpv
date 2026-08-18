@@ -1,0 +1,45 @@
+From b8f9eca148e8e97b93abffb6a8b785de91bef3d4 Mon Sep 17 00:00:00 2001
+From: qianye216 <qianye216@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 10:52:41 +0800
+Subject: [PATCH] vulkan: restore static loader
+
+Reverts shinchiro/mpv-winbuild-cmake@5f773c9 (vulkan: disable static loader).
+
+libmpv-2.dll built with the dynamic loader hard-imports vulkan-1.dll,
+which does not exist on Windows machines without a Vulkan driver, so
+ctypes.CDLL fails with ERROR_MOD_NOT_FOUND and the embedded player dies.
+The static loader has been the default from 2022 until 2026-08-04 and is
+what makes libmpv self-contained (only extra system import: cfgmgr32).
+---
+ packages/vulkan.cmake | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/packages/vulkan.cmake b/packages/vulkan.cmake
+index 305691d..d868473 100644
+--- a/packages/vulkan.cmake
++++ b/packages/vulkan.cmake
+@@ -6,6 +6,7 @@ ExternalProject_Add(vulkan
+     UPDATE_COMMAND ""
+     GIT_REMOTE_NAME origin
+     GIT_TAG main
++    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-*.patch
+     CONFIGURE_COMMAND ${EXEC} CONF=1 cmake -H<SOURCE_DIR> -B<BINARY_DIR>
+         -G Ninja
+         -DCMAKE_BUILD_TYPE=Release
+@@ -17,8 +18,12 @@ ExternalProject_Add(vulkan
+         -DBUILD_TESTS=OFF
+         -DENABLE_WERROR=OFF
+         ${vulkan_asm}
++        -DBUILD_STATIC_LOADER=ON
++        -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS -DSTRSAFE_NO_DEPRECATE -Dparse_number=cjson_parse_number'
++        -DCMAKE_CXX_FLAGS='${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS -fpermissive'
+     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
+-    INSTALL_COMMAND ${EXEC} ninja -C <BINARY_DIR> install
++    INSTALL_COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/loader/libvulkan.a ${MINGW_INSTALL_PREFIX}/lib/libvulkan.a
++            COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/loader/vulkan_own.pc ${MINGW_INSTALL_PREFIX}/lib/pkgconfig/vulkan.pc
+     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
+ )
+ 
+-- 
+2.49.0
+
