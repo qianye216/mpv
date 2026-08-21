@@ -1,20 +1,28 @@
 #include "video.h"
 #include <libplacebo/utils/frame_queue.h>  // for pl_source_frame, pl_queue_...
+#include <math.h>                          // for isnan
 #include <stddef.h>                        // for NULL
 #include <stdint.h>                        // for uint64_t, uint32_t, uintptr_t
+#include <string.h>                        // for strcmp
 #include "assert.h"                        // for assert
 #include "common/common.h"                 // for mp_rect, MPMAX, MP_ARRAY_SIZE
 #include "common/msg.h"                    // for mp_msg, MSGL_ERR, MSGL_WARN
 #include "libplacebo/colorspace.h"         // for pl_color_adjustment, pl_co...
+#include "libplacebo/dither.h"             // for pl_find_error_diffusion_kernel
 #include "libplacebo/filters.h"            // for pl_filter_nearest
 #include "libplacebo/gpu.h"                // for pl_tex_params, pl_tex_t
 #include "libplacebo/renderer.h"           // for pl_frame_mix, pl_frame
+#include "libplacebo/shaders/dithering.h"  // for pl_dither_params, PL_DITHER_...
+#include "options/m_config.h"              // for m_config_cache_alloc, m_confi...
+#include "options/m_option.h"              // for m_opt_choice_str
 #include "sub/draw_bmp.h"                  // for mp_draw_sub_formats
 #include "sub/osd.h"                       // for sub_bitmap, sub_bitmaps
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
 #include "video/csputils.h"                // for mp_csp_params, mp_csp_equa...
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
+#include "video/out/gpu/video.h"           // for gl_video_conf, gl_video_opts
+#include "video/out/gpu/video_shaders.h"  // for deband_opts
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
 #include "video/out/vo.h"                  // for vo_frame
 
@@ -75,6 +83,16 @@ struct pl_video {
 
     // Color adjustment state
     struct mp_csp_equalizer_state *video_eq; // Manages brightness, contrast, hue, etc.
+
+    // Render-quality options shared with the legacy gpu renderer and
+    // vo_gpu_next (--scale/--dscale/--cscale, sigmoid, deband, dither, ...).
+    struct m_config_cache *opts_cache;
+    // Backing storage for the pl_filter_configs handed to libplacebo; the
+    // pointer returned by map_scaler() must outlive the render call.
+    struct pl_filter_config scalers[SCALER_COUNT];
+    struct pl_sigmoid_params sigmoid_params;
+    struct pl_deband_params deband_params;
+    struct pl_dither_params dither_params;
 };
 
 /**
@@ -171,6 +189,10 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
 
     // Create the state object that tracks brightness, contrast, etc.
     p->video_eq = mp_csp_equalizer_create(p, global);
+
+    // Cache the shared renderer options so scaling honors --scale/--dscale/
+    // --cscale instead of being hardcoded (see update_render_options).
+    p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
 
     return p;
 }
@@ -313,6 +335,159 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
 }
 
 /**
+ * @brief Maps an mpv scaler unit config to a libplacebo filter configuration.
+ *
+ * Ported from vo_gpu_next.c map_scaler(). Writes the result into the
+ * persistent per-unit storage in pl_video and returns a pointer to it
+ * (or to a static fixed filter for kernels with a direct analog).
+ * @param p The pl_video engine context.
+ * @param unit The scaler unit to map (SCALER_SCALE/DSCALE/CSCALE).
+ * @return A libplacebo filter config, never NULL.
+ */
+static const struct pl_filter_config *map_scaler(struct pl_video *p,
+                                                 enum scaler_unit unit)
+{
+    static const struct pl_filter_preset fixed_scalers[] = {
+        { "bilinear",       &pl_filter_bilinear },
+        { "bicubic_fast",   &pl_filter_bicubic },
+        { "nearest",        &pl_filter_nearest },
+        { "oversample",     &pl_filter_oversample },
+        {0},
+    };
+
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    const struct scaler_config *cfg = &opts->scaler[unit];
+    struct scaler_config tmp;
+    if (cfg->kernel.function == SCALER_INHERIT) {
+        tmp = *cfg;
+        scaler_conf_merge(&tmp, &opts->scaler[SCALER_SCALE], unit);
+        cfg = &tmp;
+    }
+
+    const char *kernel_name = m_opt_choice_str(cfg->kernel.functions,
+                                               cfg->kernel.function);
+
+    for (int i = 0; fixed_scalers[i].name; i++) {
+        if (strcmp(kernel_name, fixed_scalers[i].name) == 0)
+            return fixed_scalers[i].filter;
+    }
+
+    // Attempt loading filter preset first, fall back to raw filter function
+    struct pl_filter_config *conf = &p->scalers[unit];
+    const struct pl_filter_preset *preset;
+    const struct pl_filter_function_preset *fpreset;
+    if ((preset = pl_find_filter_preset(kernel_name))) {
+        *conf = *preset->filter;
+    } else if ((fpreset = pl_find_filter_function_preset(kernel_name))) {
+        *conf = (struct pl_filter_config) {
+            .kernel = fpreset->function,
+            .params[0] = fpreset->function->params[0],
+            .params[1] = fpreset->function->params[1],
+        };
+    } else {
+        MP_ERR(p, "Failed mapping filter function '%s', no libplacebo analog?\n",
+               kernel_name);
+        return &pl_filter_bilinear;
+    }
+
+    const struct pl_filter_function_preset *wpreset;
+    if ((wpreset = pl_find_filter_function_preset(
+             m_opt_choice_str(cfg->window.functions, cfg->window.function)))) {
+        conf->window = wpreset->function;
+        conf->wparams[0] = wpreset->function->params[0];
+        conf->wparams[1] = wpreset->function->params[1];
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (!isnan(cfg->kernel.params[i]))
+            conf->params[i] = cfg->kernel.params[i];
+        if (!isnan(cfg->window.params[i]))
+            conf->wparams[i] = cfg->window.params[i];
+    }
+
+    conf->clamp = cfg->clamp;
+    if (cfg->antiring > 0.0)
+        conf->antiring = cfg->antiring;
+    if (cfg->kernel.blur > 0.0)
+        conf->blur = cfg->kernel.blur;
+    if (cfg->kernel.taper > 0.0)
+        conf->taper = cfg->kernel.taper;
+    if (cfg->radius > 0.0) {
+        if (conf->kernel->resizable) {
+            conf->radius = cfg->radius;
+        } else {
+            MP_WARN(p, "Filter radius specified but filter '%s' is not "
+                    "resizable, ignoring\n", kernel_name);
+        }
+    }
+
+    return conf;
+}
+
+/**
+ * @brief Fills pl_render_params from the shared renderer options.
+ *
+ * Ported from vo_gpu_next.c update_render_options(). The pointed-to
+ * sigmoid/deband/dither structs live in pl_video, and the filter configs
+ * persist in p->scalers, so the params stay valid until the next call
+ * overwrites them.
+ * @param p The pl_video engine context.
+ * @param params The render params to populate.
+ */
+static void update_render_options(struct pl_video *p,
+                                  struct pl_render_params *params)
+{
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    params->upscaler       = map_scaler(p, SCALER_SCALE);
+    params->downscaler     = map_scaler(p, SCALER_DSCALE);
+    params->plane_upscaler = map_scaler(p, SCALER_CSCALE);
+
+    params->skip_anti_aliasing = !opts->correct_downscaling;
+    params->disable_linear_scaling = !opts->linear_downscaling &&
+                                     !opts->linear_upscaling;
+    params->correct_subpixel_offsets = !opts->scaler_resizes_only;
+
+    params->sigmoid_params = opts->sigmoid_upscaling ? &p->sigmoid_params : NULL;
+    p->sigmoid_params.center = opts->sigmoid_center;
+    p->sigmoid_params.slope = opts->sigmoid_slope;
+
+    params->deband_params = opts->deband ? &p->deband_params : NULL;
+    p->deband_params.iterations = opts->deband_opts->iterations;
+    p->deband_params.radius = opts->deband_opts->range;
+    p->deband_params.threshold = opts->deband_opts->threshold / 16.384;
+    p->deband_params.grain = opts->deband_opts->grain / 8.192;
+
+    params->dither_params = NULL;
+    params->error_diffusion = NULL;
+
+    switch (opts->dither_algo) {
+    case DITHER_ERROR_DIFFUSION:
+        params->error_diffusion = pl_find_error_diffusion_kernel(opts->error_diffusion);
+        if (!params->error_diffusion) {
+            MP_WARN(p, "Could not find error diffusion kernel '%s', falling "
+                    "back to fruit.\n", opts->error_diffusion);
+        }
+        MP_FALLTHROUGH;
+    case DITHER_ORDERED:
+    case DITHER_FRUIT:
+        params->dither_params = &p->dither_params;
+        p->dither_params.method = opts->dither_algo == DITHER_ORDERED
+                                ? PL_DITHER_ORDERED_FIXED
+                                : PL_DITHER_BLUE_NOISE;
+        p->dither_params.lut_size = opts->dither_size;
+        p->dither_params.temporal = opts->temporal_dither;
+        break;
+    }
+
+    if (opts->dither_depth < 0) {
+        params->dither_params = NULL;
+        params->error_diffusion = NULL;
+    }
+}
+
+/**
  * @brief Main rendering function for a single video frame.
  * @param p The pl_video engine context.
  * @param frame The mpv frame to render, containing the current image.
@@ -388,11 +563,13 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     // frame's duration is equivalent to one source frame (1.0 in normalized time).
     mix.vsync_duration = 1.0f;
 
-    // Prepare the rendering parameters for libplacebo
-    struct pl_render_params params = {
-        .upscaler = &pl_filter_nearest,
-        .downscaler = &pl_filter_nearest,
-    };
+    // Prepare the rendering parameters for libplacebo from the shared
+    // renderer options (--scale/--dscale/--cscale, sigmoid, deband, dither).
+    // These were previously hardcoded to pl_filter_nearest, which ignored the
+    // user's scaler settings entirely and degraded picture quality compared
+    // to the legacy gpu backend.
+    struct pl_render_params params = {0};
+    update_render_options(p, &params);
 
     // Declare a local struct to hold the color adjustment values.
     struct pl_color_adjustment color_adj;
@@ -486,10 +663,10 @@ struct mp_image *pl_video_screenshot(struct pl_video *p, struct vo_frame *frame)
     update_overlays(p, osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
                     &p->osd_state_storage, &target_frame, frame->current);
 
-    const struct pl_render_params params = {
-        .upscaler = &pl_filter_nearest,
-        .downscaler = &pl_filter_nearest,
-    };
+    // Same option mapping as pl_video_render() so screenshots match the
+    // on-screen scaling quality.
+    struct pl_render_params params = {0};
+    update_render_options(p, &params);
 
     if (!ra_next_render_image(p->ra, &source_frame, &target_frame, &params)) {
         mp_msg(p->log, MSGL_ERR, "pl_video_screenshot: rendering failed\n");
