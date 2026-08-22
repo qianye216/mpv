@@ -86,7 +86,7 @@ fetch() { # fetch <url> [git-tag]
         archive=$WORK/src/$name
         log "下载 $url"
         curl -fL --retry 3 -o "$archive" "$url"
-        topdir=$(tar tf "$archive" | head -1 | cut -d/ -f1)
+        topdir=$(tar tf "$archive" | sed -n 1p | cut -d/ -f1)
         case "$archive" in
             *.tar.gz)  tar xzf "$archive" -C "$WORK/src" ;;
             *.tar.xz)  tar xJf "$archive" -C "$WORK/src" ;;
@@ -393,7 +393,10 @@ command -v pkg-config >/dev/null || die "缺少 pkg-config"
 MAX_SDK_MAJOR=14
 SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
 SDK_MAJOR=${SDK_VERSION%%.*}
-XCODE_DESC=$(xcodebuild -version 2>/dev/null | head -1)
+# 注意：不要用 "| head -1" 截取首行——head 提前退出会让上游进程收到
+# SIGPIPE，pipefail 下偶发(实测约 1/30)静默杀死整个脚本（exit 141）
+XCODE_DESC=$(xcodebuild -version 2>/dev/null || true)
+XCODE_DESC=${XCODE_DESC%%$'\n'*}
 log "工具链: $XCODE_DESC, macOS SDK $SDK_VERSION"
 if (( SDK_MAJOR > MAX_SDK_MAJOR )); then
     MSG="当前 SDK 为 macOS ${SDK_VERSION}（${XCODE_DESC}），高于 macOS 14 SDK。"
@@ -447,7 +450,7 @@ for a in "${ARCHS[@]}"; do
     minos=$(otool -arch "$a" -l "$DIST/libmpv.2.dylib" 2>/dev/null \
         | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}' || true)
     if [[ -z $minos ]] \
-       || [[ $(printf '%s\n%s\n' "$minos" "$DEPLOYMENT_TARGET" | sort -V | head -1) != "$minos" ]]; then
+       || [[ $(printf '%s\n%s\n' "$minos" "$DEPLOYMENT_TARGET" | sort -V | sed -n 1p) != "$minos" ]]; then
         die "[$a] 切片部署目标异常: minos=${minos:-未知}（应 ≤ ${DEPLOYMENT_TARGET}）"
     fi
     log "[$a] minos=$minos ✓"

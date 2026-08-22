@@ -60,7 +60,26 @@ jobs:
           echo "DEVELOPER_DIR=$best" >> "$GITHUB_ENV"
 
       - name: Build universal libmpv.2.dylib
-        run: ./ci/build-libmpv-macos.sh universal
+        run: |
+          set -o pipefail
+          ./ci/build-libmpv-macos.sh universal 2>&1 | tee build-macos-static.log
+
+      # 失败时把日志尾部写进 step 日志与 run 摘要页，无需下载 artifact 即可排障
+      - name: Dump build log tail (on failure)
+        if: failure()
+        run: |
+          tail -n 150 build-macos-static.log || true
+          { echo '### build 失败日志尾部'; echo '```'; \
+            tail -n 150 build-macos-static.log | sed $'s/\x1b\\[[0-9;]*m//g'; echo '```'; \
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-macos-static.log
+          if-no-files-found: ignore
 
       - name: Smoke test (dlopen + create/initialize)
         run: |
