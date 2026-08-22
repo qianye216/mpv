@@ -10,8 +10,11 @@
 #   WORK        构建目录（默认 ./build-macos-static）
 #   MPV_SOURCE  mpv 源码目录（默认脚本所在仓库根目录）
 #   FORCE       =1 时忽略 stamp 重新构建已完成的包
+#   ALLOW_UNSUPPORTED_SDK=1  允许用 SDK 15+（Xcode 16+）构建，产物将无法
+#               在 macOS 14 及以下加载（见下方工具链守卫），仅限本机实验
 #
 # 产物: $WORK/dist/libmpv.2.dylib（universal 时为 arm64+x86_64 双架构）
+#       用 Xcode 15.x（macOS 14 SDK）构建时支持 macOS 11.0+。
 
 set -euo pipefail
 
@@ -136,6 +139,10 @@ c_args = ['-O2', '-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET', '-fPI
 c_link_args = ['-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET']
 cpp_args = ['-O2', '-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET', '-fPIC']
 cpp_link_args = ['-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET']
+# mpv 有大量 .m 文件（cocoa 事件循环等），交叉编译时 objc 同样需要
+# 架构/部署目标参数，否则按 host 架构编译导致链接失败
+objc_args = ['-O2', '-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET', '-fPIC']
+objc_link_args = ['-arch', '$1', '-mmacosx-version-min=$DEPLOYMENT_TARGET']
 
 [host_machine]
 system = 'darwin'
@@ -239,11 +246,17 @@ build_arch() { # build_arch <arch>
     build_meson "$(fetch "$SRC_DAV1D")" "$prefix" dav1d
 
     # 3. https 所需 TLS（ffmpeg 用 mbedtls）
+    # 注意：git 克隆没有预生成文件（psa_crypto_driver_wrappers 等），
+    # GEN_FILES=OFF 会让 cmake 的源文件列表 glob 落空、静默产出残缺的
+    # libmbedtls/libmbedcrypto（缺 psa_*.o，ffmpeg 链接失败），必须让
+    # 构建现场生成（需要 python3，mbedtls 自带框架脚本）
     build_cmake "$(fetch "$SRC_MBEDTLS" "$TAG_MBEDTLS")" "$prefix" mbedtls "$arch" \
-        -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF -DENABLE_EXAMPLES=OFF \
-        -DGEN_FILES=OFF
+        -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF -DENABLE_EXAMPLES=OFF
 
     # 4. ffmpeg（静态，禁用自动探测保证配料可控；硬解走 VideoToolbox）
+    # 注意：不开 --enable-lzma，新版 Xcode SDK 已不带 lzma.h（系统
+    # liblzma.dylib 尚在，但 configure 头文件检查过不去；ffmpeg 仅个别
+    # 冷门 demuxer 用到 lzma）
     local d_ffmpeg; d_ffmpeg=$(fetch "$SRC_FFMPEG")
     done_pkg "$prefix" ffmpeg && { log "跳过 ffmpeg（已完成）"; } || {
         log "构建 ffmpeg"
@@ -255,13 +268,14 @@ build_arch() { # build_arch <arch>
             --disable-programs --disable-doc --disable-debug \
             --disable-autodetect \
             --enable-gpl \
-            --enable-zlib --enable-bzlib --enable-lzma \
+            --enable-version3 \
+            --enable-zlib --enable-bzlib \
             --enable-iconv \
             --enable-libdav1d \
             --enable-mbedtls \
             --enable-videotoolbox \
-            --extra-cflags="-mmacosx-version-min=$DEPLOYMENT_TARGET -arch $arch" \
-            --extra-ldflags="-mmacosx-version-min=$DEPLOYMENT_TARGET -arch $arch")
+            --extra-cflags="-mmacosx-version-min=$DEPLOYMENT_TARGET -arch $arch -I$prefix/include" \
+            --extra-ldflags="-mmacosx-version-min=$DEPLOYMENT_TARGET -arch $arch -L$prefix/lib")
         make -C "$bdir" -j"$JOBS" >/dev/null
         make -C "$bdir" install >/dev/null
         mark_pkg "$prefix" ffmpeg
@@ -282,7 +296,12 @@ build_arch() { # build_arch <arch>
         build_autotools "$d_bluray" "$prefix" libbluray \
             --disable-bdjava-jar --without-libxml2 --without-freetype
     fi
-    build_autotools "$d_dvdcss" "$prefix" libdvdcss
+    # libdvdcss 1.6.0 起改用 meson 构建
+    if [[ -f $d_dvdcss/meson.build ]]; then
+        build_meson "$d_dvdcss" "$prefix" libdvdcss
+    else
+        build_autotools "$d_dvdcss" "$prefix" libdvdcss
+    fi
     if [[ -f $d_dvdread/meson.build ]]; then
         build_meson "$d_dvdread" "$prefix" libdvdread
     else
@@ -295,8 +314,10 @@ build_arch() { # build_arch <arch>
     fi
 
     # 6. 其它: uchardet / lcms2 / libarchive
+    # uchardet 0.0.8 的 cmake_minimum_required 低于 3.5，CMake 4.x 需要
+    # 显式放宽策略版本才能配置
     build_cmake "$(fetch "$SRC_UCHARDET")" "$prefix" uchardet "$arch" \
-        -DBUILD_BINARY=OFF
+        -DBUILD_BINARY=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     build_autotools "$(fetch "$SRC_LCMS2")" "$prefix" lcms2 \
         --without-tiff --without-jpeg --without-fastfloat
     local d_libarchive; d_libarchive=$(fetch "$SRC_LIBARCHIVE")
@@ -326,13 +347,22 @@ build_arch() { # build_arch <arch>
                     -Dlcms2=enabled -Duchardet=enabled
                     -Dgl=enabled -Dgl-cocoa=enabled
                     -Dvulkan=disabled
-                    -Dlua=disabled -Djavascript=disabled -Dcurl=disabled
-                    -Dswift-build=disabled -Dmacos-cocoa-cb=disabled
+                    -Dlua=disabled -Djavascript=disabled
+                    # curl 构建选项已被 mpv master 移除（stream-curl 已删）
+                    # swift-build 必须开：clipboard-mac.m 无条件编入（依赖
+                    # swift 构建生成的 osdep/mac/swift.h 桥接头），关掉会编译失败
+                    -Dswift-build=enabled -Dmacos-cocoa-cb=disabled
                     -Dzimg=disabled -Drubberband=disabled -Djpeg=disabled
                     -Dvapoursynth=disabled -Dlibavdevice=disabled
                     -Dpdf-build=disabled
                     )
     if setup_env_is_cross; then setup+=(--cross-file "$CROSSFILE"); fi
+    # Swift 由 osdep/mac/meson.build 直接调 swiftc 编译，不吃 cross-file 的
+    # 架构参数，交叉编译时必须用 -Dswift-flags 显式指定 -target，
+    # 否则 Swift 对象按 host 架构产出、与目标切片链接失败
+    if setup_env_is_cross; then
+        setup+=(-Dswift-flags="-target $arch-apple-macos$DEPLOYMENT_TARGET")
+    fi
     "${setup[@]}"
     ninja -C "$bdir" install >/dev/null
 
@@ -351,6 +381,29 @@ command -v meson  >/dev/null || die "缺少 meson（brew install meson）"
 command -v ninja  >/dev/null || die "缺少 ninja（brew install ninja）"
 command -v cmake  >/dev/null || die "缺少 cmake（brew install cmake 或 xcode）"
 command -v pkg-config >/dev/null || die "缺少 pkg-config"
+
+# ---------------------------- 工具链/SDK 守卫 ----------------------------
+# Xcode 16+（SDK 15+）编译 mpv 的 Swift 层时会给产物引入对
+# /usr/lib/swift/libswiftFoundation.dylib 的硬依赖（LC_LOAD_DYLIB），
+# 该库 macOS 15 起才随系统提供 → dylib 在 macOS 14 及以下 dlopen 直接
+# 失败（115-Desktop 1.5.2 在 macOS 14.5 上播放器全挂的根因）。
+# 因此构建"支持 macOS<15"的产物必须用 Xcode 15.x（SDK 14.x）。
+#   CI：workflow 自动选择 runner 上的 Xcode 15.x（DEVELOPER_DIR）。
+#   本机装了多个 Xcode 时：DEVELOPER_DIR=/Applications/Xcode_15.4.app ci/build-libmpv-macos.sh
+MAX_SDK_MAJOR=14
+SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+SDK_MAJOR=${SDK_VERSION%%.*}
+XCODE_DESC=$(xcodebuild -version 2>/dev/null | head -1)
+log "工具链: $XCODE_DESC, macOS SDK $SDK_VERSION"
+if (( SDK_MAJOR > MAX_SDK_MAJOR )); then
+    MSG="当前 SDK 为 macOS ${SDK_VERSION}（${XCODE_DESC}），高于 macOS 14 SDK。"
+    DETAIL="Xcode 16+ 会给 Swift 层引入 libswiftFoundation.dylib 硬依赖（仅 macOS 15+ 有），产物无法在 macOS<15 加载。请改用 Xcode 15.x（CI 自动选择；本机用 DEVELOPER_DIR 切换）。确认只要本地实验可 ALLOW_UNSUPPORTED_SDK=1 跳过。"
+    if [[ ${ALLOW_UNSUPPORTED_SDK:-0} == 1 ]]; then
+        log "警告: $MSG 跳过守卫继续构建，产物仅支持 macOS 15+。"
+    else
+        die "$MSG $DETAIL"
+    fi
+fi
 
 for a in "${ARCHS[@]}"; do
     build_arch "$a"
@@ -377,5 +430,27 @@ otool -L "$DIST/libmpv.2.dylib" | tail -n +2 | sed 's/^ *//' >&2
 if otool -L "$DIST/libmpv.2.dylib" | grep -qE '/opt/(homebrew|local)|/usr/local'; then
     die "产物仍依赖非系统库（brew/local 路径），不是自包含的！"
 fi
+
+# ---- macOS<15 兼容性硬校验（与上方工具链守卫呼应） ----
+# 1) 不允许非弱链接的 libswiftFoundation：该库 macOS 15 起才随系统提供，
+#    出现硬依赖即意味着产物在 macOS 14 及以下 dlopen 失败
+if otool -L "$DIST/libmpv.2.dylib" | grep 'libswiftFoundation.dylib' | grep -qv '(weak)'; then
+    MSG="产物含 libswiftFoundation.dylib 硬依赖（仅 macOS 15+ 提供），无法在 macOS<15 加载！"
+    if [[ ${ALLOW_UNSUPPORTED_SDK:-0} == 1 ]]; then
+        log "警告: ${MSG}（ALLOW_UNSUPPORTED_SDK=1，放行）"
+    else
+        die "$MSG 请用 Xcode 15.x（SDK 14.x）重新构建。"
+    fi
+fi
+# 2) 每个架构切片的部署目标不得高于 $DEPLOYMENT_TARGET
+for a in "${ARCHS[@]}"; do
+    minos=$(otool -arch "$a" -l "$DIST/libmpv.2.dylib" 2>/dev/null \
+        | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}' || true)
+    if [[ -z $minos ]] \
+       || [[ $(printf '%s\n%s\n' "$minos" "$DEPLOYMENT_TARGET" | sort -V | head -1) != "$minos" ]]; then
+        die "[$a] 切片部署目标异常: minos=${minos:-未知}（应 ≤ ${DEPLOYMENT_TARGET}）"
+    fi
+    log "[$a] minos=$minos ✓"
+done
 ls -lh "$DIST/libmpv.2.dylib" >&2
 log "完成: $DIST/libmpv.2.dylib"
