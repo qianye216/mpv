@@ -29,9 +29,13 @@ class View: NSView, CALayerDelegate {
     override var acceptsFirstResponder: Bool { return true }
 
     override var isOpaque: Bool {
+        // MetalLayer 仅在启用 vulkan 时编译（见 meson.build 的 swift_sources），
+        // cocoa+swift+vulkan=disabled 的组合下必须屏蔽该分支
+        #if HAVE_VULKAN
         if let metalLayer = layer as? MetalLayer {
             return !metalLayer.isOpaque
         }
+        #endif
 
         return true
     }
