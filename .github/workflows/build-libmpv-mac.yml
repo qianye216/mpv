@@ -10,9 +10,13 @@ name: build-libmpv-macos
 # ⚠️ 工具链锁定：必须用 Xcode 15.x（macOS 14 SDK）构建。Xcode 16+/SDK 15+
 # 会给 Swift 层引入 /usr/lib/swift/libswiftFoundation.dylib 硬依赖，该库
 # macOS 15 起才随系统提供，产物将无法在 macOS 14 及以下加载（115-Desktop
-# 在 macOS 14.5 用户上播放器不可用的根因）。runner 默认 Xcode 版本较新，
-# 故下方有一步自动选择 Xcode 15.x；脚本内置同款 SDK 守卫双保险。
-# 构建产物声明支持 macOS 11.0+，并由 verify-macos14 job 实测 macOS 14。
+# 在 macOS 14.5 用户上播放器不可用的根因）。macos-15 镜像已不带 Xcode 15.x
+# （2026-08 实测仅 16.0–16.4/26.x），故跑在 macos-14 上（Xcode 15 世代），
+# 下方仍有自动选择 Xcode 15.x 的一步；脚本内置同款 SDK 守卫双保险。
+# 注意：macos-14 镜像 2026-11-02 停用，届时需要迁移（自托管 runner、
+# CI 内下载 Xcode 15.4、或放弃 macOS<15 支持），见 runner-images 弃用公告。
+# 构建产物声明支持 macOS 11.0+；构建即运行在 macOS 14 上，冒烟测试直接
+# 覆盖线上 macOS 14.5 用户场景。
 
 on:
   workflow_dispatch:
@@ -22,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
     env:
       # ci/build-libmpv-macos.sh 默认 WORK=<仓库根>/build-macos-static
       ARTIFACT: build-macos-static/dist/libmpv.2.dylib
@@ -60,6 +64,16 @@ jobs:
 
       - name: Smoke test (dlopen + create/initialize)
         run: |
+          # 静态断言：禁止非弱链接的 libswiftFoundation（macOS 15+ 才有）
+          if otool -L "$ARTIFACT" | grep 'libswiftFoundation.dylib' | grep -qv '(weak)'; then
+            echo "::error::存在 libswiftFoundation.dylib 硬依赖，产物无法在 macOS 14 加载"; exit 1
+          fi
+          for a in arm64 x86_64; do
+            minos=$(otool -arch "$a" -l "$ARTIFACT" 2>/dev/null \
+              | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            echo "[$a] minos=$minos"
+            [[ $minos == 11.0 ]] || { echo "::error::[$a] minos 异常: $minos"; exit 1; }
+          done
           cat > /tmp/smoke.c <<'EOF'
           #include <dlfcn.h>
           #include <stdio.h>
@@ -102,62 +116,3 @@ jobs:
           name: libmpv.2.dylib-macos-universal
           path: ${{ env.ARTIFACT }}
           if-no-files-found: error
-
-  # 在 macOS 14 runner 上实测加载（对应线上 macOS 14.5 用户的真实场景）。
-  # 注意：macos-14 镜像 2026-07-06 起进入弃用期、2026-11-02 停用，
-  # 到期后删除本 job 即可（构建脚本/workflow 的静态校验依然兜底）。
-  verify-macos14:
-    name: verify dlopen on macOS 14
-    needs: build
-    runs-on: macos-14
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: libmpv.2.dylib-macos-universal
-
-      - name: Static compatibility checks
-        run: |
-          lipo -info libmpv.2.dylib
-          # 禁止非弱链接的 libswiftFoundation（macOS 15+ 才有）
-          if otool -L libmpv.2.dylib | grep 'libswiftFoundation.dylib' | grep -qv '(weak)'; then
-            echo "::error::存在 libswiftFoundation.dylib 硬依赖，产物无法在 macOS 14 加载"; exit 1
-          fi
-          # 部署目标必须 ≤ 11.0
-          for a in arm64 x86_64; do
-            minos=$(otool -arch "$a" -l libmpv.2.dylib 2>/dev/null \
-              | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
-            echo "[$a] minos=$minos"
-            [[ $minos == 11.0 ]] || { echo "::error::[$a] minos 异常: $minos"; exit 1; }
-          done
-
-      - name: dlopen + mpv_initialize on macOS 14
-        run: |
-          cat > /tmp/smoke.c <<'EOF'
-          #include <dlfcn.h>
-          #include <stdio.h>
-          int main(int argc, char **argv) {
-              void *h = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
-              if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-              unsigned (*ver)(void) = dlsym(h, "mpv_client_api_version");
-              void *(*create)(void) = dlsym(h, "mpv_create");
-              int (*init)(void *) = dlsym(h, "mpv_initialize");
-              void (*term)(void *) = dlsym(h, "mpv_terminate_destroy");
-              if (!ver || !create || !init || !term) return 2;
-              printf("client API %x\n", ver());
-              void *ctx = create();
-              if (!ctx) return 3;
-              if (init(ctx) < 0) return 4;
-              term(ctx);
-              printf("smoke OK\n");
-              return 0;
-          }
-          EOF
-          clang /tmp/smoke.c -o /tmp/smoke
-          /tmp/smoke libmpv.2.dylib
-          if arch -x86_64 /usr/bin/true 2>/dev/null; then
-            clang -arch x86_64 /tmp/smoke.c -o /tmp/smoke-x64
-            arch -x86_64 /tmp/smoke-x64 libmpv.2.dylib
-          else
-            echo "runner 无 Rosetta，跳过 x86_64 冒烟测试"
-          fi
